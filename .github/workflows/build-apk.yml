@@ -1,1 +1,3041 @@
+# ======================================================================
+#  SERVER MC - workflow GitHub Actions yang membangun APK
+#
+#  Isi file ini sudah lengkap: source aplikasi Android, panel server, dan
+#  pemasang Termux. Tidak ada file lain yang perlu diunggah.
+#
+#  Cara pakai (bisa dari HP, lewat situs github.com):
+#   1. Buat repository baru di GitHub (boleh private).
+#   2. Add file > Create new file. Nama file persis:
+#        .github/workflows/build-apk.yml
+#      Tempel seluruh isi file ini, lalu Commit.
+#   3. Buka tab Actions > "Build APK Server MC". Build jalan otomatis setelah
+#      commit (atau tekan Run workflow). Tunggu sekitar 2 sampai 4 menit.
+#   4. APK ada di halaman Releases (ServerMC.apk), atau di Actions > build
+#      terakhir > Artifacts (ServerMC-apk).
+#   5. Pasang APK. Kalau sudah ada versi lama, copot dulu karena tanda
+#      tangannya berbeda tiap build.
+#
+#  Aplikasi ini memasang dan mengontrol server Minecraft (Paper + Geyser)
+#  yang jalan di Termux. Pasang Termux dari F-Droid, lalu ikuti langkah 1-3
+#  di layar aplikasi.
+# ======================================================================
+name: Build APK Server MC
 
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pasang JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Tulis source aplikasi
+        run: |
+          set -euo pipefail
+          mkdir -p app/java/id/servermc/panel app/res/drawable app/assets
+
+          cat > app/AndroidManifest.xml <<'__EOF_ANDROIDMANIFEST_XML__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              package="id.servermc.panel">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <!-- supaya aplikasi bisa mendeteksi dan membuka Termux (Android 11 ke atas) -->
+              <queries>
+                  <package android:name="com.termux" />
+              </queries>
+
+              <application
+                  android:allowBackup="false"
+                  android:icon="@drawable/ic"
+                  android:label="Server MC"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
+                  android:usesCleartextTraffic="true">
+                  <activity
+                      android:name=".MainActivity"
+                      android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          __EOF_ANDROIDMANIFEST_XML__
+
+          cat > app/res/drawable/ic.xml <<'__EOF_IC_XML__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path android:fillColor="#1B2029" android:pathData="M0,0h108v108h-108z" />
+              <path android:fillColor="#7A5230" android:pathData="M22,30h64v56h-64z" />
+              <path android:fillColor="#5A3D22" android:pathData="M30,56h12v12h-12z M62,66h12v12h-12z M46,74h10v10h-10z" />
+              <path android:fillColor="#4A9A67" android:pathData="M22,30h64v22h-64z" />
+              <path android:fillColor="#6BD08F" android:pathData="M22,30h64v10h-64z" />
+              <path android:fillColor="#4A9A67" android:pathData="M22,52h12v10h-12z M50,52h14v8h-14z M74,52h12v12h-12z" />
+          </vector>
+          __EOF_IC_XML__
+
+          cat > app/java/id/servermc/panel/MainActivity.java <<'__EOF_MAINACTIVITY_JAVA__'
+          package id.servermc.panel;
+
+          import android.app.Activity;
+          import android.content.ClipData;
+          import android.content.ClipboardManager;
+          import android.content.ContentValues;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.graphics.Bitmap;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.graphics.drawable.GradientDrawable;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Environment;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.provider.MediaStore;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.webkit.CookieManager;
+          import android.webkit.DownloadListener;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceError;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.widget.Button;
+          import android.widget.FrameLayout;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.net.URLDecoder;
+          import java.util.regex.Matcher;
+          import java.util.regex.Pattern;
+
+          public class MainActivity extends Activity {
+              static final String PANEL = "http://127.0.0.1:8080/";
+              static final int BG = 0xFF1B2029, CARD = 0xFF252C38, EDGE = 0xFF0D1016, TX = 0xFFE9EDF4, MUT = 0xFF98A4BA,
+                      BLUE = 0xFF3D6FE0, GREEN = 0xFF3DBD7D, SLATE = 0xFF2E3745, DARKGREEN = 0xFF2D8A5B;
+              static final int REQ_FILE = 77;
+              static final String ERR_HTML = "<meta name=viewport content='width=device-width,initial-scale=1'>"
+                      + "<body style='background:#1b2029;color:#e9edf4;font:16px sans-serif;padding:24px'>"
+                      + "<h2>Panel belum aktif</h2>"
+                      + "<p>Buka Termux lalu jalankan: <b>mc panel start</b></p>"
+                      + "<p>Kalau belum pernah memasang, kembali ke menu dan pilih langkah 2.</p>"
+                      + "<p><a style='color:#5b88f0' href='" + PANEL + "'>Coba lagi</a></p></body>";
+
+              LocalServer server;
+              FrameLayout root;
+              ScrollView home;
+              LinearLayout webBox;
+              WebView web;
+              TextView status, cmdView;
+              ValueCallback<Uri[]> fileCb;
+              boolean failed;
+              final Handler ui = new Handler(Looper.getMainLooper());
+              final Runnable poll = new Runnable() {
+                  @Override
+                  public void run() {
+                      checkStatus();
+                      ui.postDelayed(this, 3000);
+                  }
+              };
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  try {
+                      server = new LocalServer(getAssets());
+                      server.start();
+                  } catch (Exception e) {
+                      server = null;
+                  }
+                  root = new FrameLayout(this);
+                  root.setBackgroundColor(BG);
+                  buildHome();
+                  buildWeb();
+                  root.addView(home);
+                  root.addView(webBox);
+                  setContentView(root);
+                  showHome();
+              }
+
+              // ───────────── tampilan
+              int dp(int v) {
+                  return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
+              }
+
+              TextView tv(String s, int sp, int color, boolean bold) {
+                  TextView t = new TextView(this);
+                  t.setText(s);
+                  t.setTextSize(sp);
+                  t.setTextColor(color);
+                  if (bold) t.setTypeface(Typeface.DEFAULT_BOLD);
+                  return t;
+              }
+
+              Button btn(String s, int bg, View.OnClickListener l, boolean small) {
+                  Button b = new Button(this);
+                  b.setText(s);
+                  b.setAllCaps(false);
+                  b.setTextColor(Color.WHITE);
+                  b.setTextSize(small ? 14 : 16);
+                  GradientDrawable d = new GradientDrawable();
+                  d.setColor(bg);
+                  d.setStroke(dp(2), EDGE);
+                  b.setBackground(d);
+                  b.setPadding(dp(14), dp(small ? 6 : 12), dp(14), dp(small ? 6 : 12));
+                  b.setOnClickListener(l);
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                          small ? ViewGroup.LayoutParams.WRAP_CONTENT : ViewGroup.LayoutParams.MATCH_PARENT,
+                          ViewGroup.LayoutParams.WRAP_CONTENT);
+                  lp.setMargins(0, dp(6), small ? dp(8) : 0, dp(6));
+                  b.setLayoutParams(lp);
+                  return b;
+              }
+
+              void buildHome() {
+                  LinearLayout col = new LinearLayout(this);
+                  col.setOrientation(LinearLayout.VERTICAL);
+                  col.setPadding(dp(16), dp(28), dp(16), dp(36));
+                  col.addView(tv("Server MC", 28, TX, true));
+                  col.addView(tv("Server Minecraft Java dan Bedrock di HP kamu. Servernya jalan di Termux; aplikasi ini jadi pemasang dan panel kontrolnya.", 14, MUT, false));
+                  status = tv("", 15, TX, true);
+                  status.setPadding(0, dp(18), 0, dp(8));
+                  col.addView(status);
+
+                  col.addView(btn("1. Pasang Termux (F-Droid)", SLATE, new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          open("https://f-droid.org/packages/com.termux/");
+                      }
+                  }, false));
+                  col.addView(btn("2. Salin perintah pasang, lalu buka Termux", BLUE, new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          installFlow();
+                      }
+                  }, false));
+                  col.addView(btn("3. Buka panel server", DARKGREEN, new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          showWeb();
+                      }
+                  }, false));
+                  col.addView(btn("Buka Termux (panel menyala otomatis)", SLATE, new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          openTermux();
+                      }
+                  }, false));
+
+                  cmdView = tv("", 12, GREEN, false);
+                  cmdView.setTypeface(Typeface.MONOSPACE);
+                  cmdView.setTextIsSelectable(true);
+                  cmdView.setPadding(dp(10), dp(10), dp(10), dp(10));
+                  cmdView.setBackgroundColor(0xFF0F1319);
+                  col.addView(cmdView);
+
+                  TextView help = tv("Cara pakai:\n"
+                          + "1. Pasang Termux dari F-Droid (versi Play Store sudah tidak bisa dipakai).\n"
+                          + "2. Tekan tombol 2, di Termux tahan layar lalu pilih Paste, tekan Enter. Jawab 2 pertanyaan (kontak dan EULA). Jangan tutup aplikasi ini sampai Termux mulai mengunduh paket.\n"
+                          + "3. Setelah selesai, kembali ke sini dan tekan tombol 3.\n\n"
+                          + "Pemain Bedrock join lewat Geyser: alamat IP HP dan port 19132 (UDP). Matikan penghemat baterai untuk Termux supaya server tidak dimatikan Android.\n\n"
+                          + "Perintah di Termux: mc start, mc stop, mc console, mc backup, mc update, mc passwd, mc help.", 13, MUT, false);
+                  help.setPadding(0, dp(16), 0, 0);
+                  col.addView(help);
+
+                  home = new ScrollView(this);
+                  home.setBackgroundColor(BG);
+                  home.addView(col);
+              }
+
+              void buildWeb() {
+                  webBox = new LinearLayout(this);
+                  webBox.setOrientation(LinearLayout.VERTICAL);
+                  webBox.setBackgroundColor(BG);
+                  LinearLayout bar = new LinearLayout(this);
+                  bar.setOrientation(LinearLayout.HORIZONTAL);
+                  bar.setBackgroundColor(CARD);
+                  bar.setPadding(dp(8), dp(4), dp(8), dp(4));
+                  bar.addView(btn("‹ Menu", SLATE, new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          showHome();
+                      }
+                  }, true));
+                  bar.addView(btn("Muat ulang", SLATE, new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          if (failed || web.getUrl() == null) web.loadUrl(PANEL);
+                          else web.reload();
+                      }
+                  }, true));
+
+                  web = new WebView(this);
+                  web.setBackgroundColor(BG);
+                  WebSettings s = web.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setAllowFileAccess(false);
+                  CookieManager.getInstance().setAcceptCookie(true);
+                  web.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
+                          Uri u = r.getUrl();
+                          String host = u.getHost();
+                          if ("127.0.0.1".equals(host) || "localhost".equals(host)) return false;
+                          open(u.toString());
+                          return true;
+                      }
+
+                      @Override
+                      public void onPageStarted(WebView v, String url, Bitmap icon) {
+                          failed = false;
+                      }
+
+                      @Override
+                      public void onReceivedError(WebView v, WebResourceRequest r, WebResourceError e) {
+                          if (r.isForMainFrame()) {
+                              failed = true;
+                              v.loadDataWithBaseURL(PANEL, ERR_HTML, "text/html", "utf-8", null);
+                          }
+                      }
+                  });
+                  web.setWebChromeClient(new WebChromeClient() {
+                      @Override
+                      public boolean onShowFileChooser(WebView w, ValueCallback<Uri[]> cb, FileChooserParams p) {
+                          if (fileCb != null) fileCb.onReceiveValue(null);
+                          fileCb = cb;
+                          Intent i = new Intent(Intent.ACTION_GET_CONTENT);
+                          i.addCategory(Intent.CATEGORY_OPENABLE);
+                          i.setType("*/*");
+                          try {
+                              startActivityForResult(Intent.createChooser(i, "Pilih file"), REQ_FILE);
+                          } catch (Exception e) {
+                              fileCb = null;
+                              return false;
+                          }
+                          return true;
+                      }
+                  });
+                  web.setDownloadListener(new DownloadListener() {
+                      @Override
+                      public void onDownloadStart(String url, String ua, String cd, String mime, long len) {
+                          download(url, cd);
+                      }
+                  });
+                  webBox.addView(bar, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+                  webBox.addView(web, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+              }
+
+              void showHome() {
+                  webBox.setVisibility(View.GONE);
+                  home.setVisibility(View.VISIBLE);
+              }
+
+              void showWeb() {
+                  home.setVisibility(View.GONE);
+                  webBox.setVisibility(View.VISIBLE);
+                  if (web.getUrl() == null || failed) web.loadUrl(PANEL);
+              }
+
+              // ───────────── aksi
+              void installFlow() {
+                  if (server == null) {
+                      toast("Server lokal gagal jalan. Tutup lalu buka aplikasi ini lagi.");
+                      return;
+                  }
+                  String cmd = server.command();
+                  cmdView.setText(cmd);
+                  ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                  cm.setPrimaryClip(ClipData.newPlainText("Perintah pasang", cmd));
+                  if (openTermux()) toast("Perintah disalin. Di Termux: tahan layar, pilih Paste, lalu Enter.");
+              }
+
+              boolean openTermux() {
+                  Intent i = getPackageManager().getLaunchIntentForPackage("com.termux");
+                  if (i == null) {
+                      toast("Termux belum terpasang. Pakai tombol 1.");
+                      return false;
+                  }
+                  startActivity(i);
+                  return true;
+              }
+
+              void open(String url) {
+                  try {
+                      startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
+                  } catch (Exception e) {
+                      toast("Tidak ada aplikasi untuk membuka tautan ini.");
+                  }
+              }
+
+              void toast(final String s) {
+                  runOnUiThread(new Runnable() {
+                      @Override
+                      public void run() {
+                          Toast.makeText(MainActivity.this, s, Toast.LENGTH_LONG).show();
+                      }
+                  });
+              }
+
+              boolean installed(String pkg) {
+                  try {
+                      getPackageManager().getPackageInfo(pkg, 0);
+                      return true;
+                  } catch (Exception e) {
+                      return false;
+                  }
+              }
+
+              void checkStatus() {
+                  new Thread(new Runnable() {
+                      @Override
+                      public void run() {
+                          final boolean termux = installed("com.termux");
+                          boolean ok = false;
+                          try {
+                              HttpURLConnection c = (HttpURLConnection) new URL(PANEL + "api/session").openConnection();
+                              c.setConnectTimeout(700);
+                              c.setReadTimeout(700);
+                              ok = c.getResponseCode() == 200;
+                              c.disconnect();
+                          } catch (Exception ignored) {
+                          }
+                          final boolean panel = ok;
+                          ui.post(new Runnable() {
+                              @Override
+                              public void run() {
+                                  status.setText("Termux: " + (termux ? "terpasang" : "belum terpasang")
+                                          + "\nPanel server: " + (panel ? "aktif" : "belum aktif"));
+                                  status.setTextColor(panel ? GREEN : TX);
+                              }
+                          });
+                      }
+                  }).start();
+              }
+
+              static String fileName(String cd, String url) {
+                  try {
+                      if (cd != null) {
+                          Matcher m = Pattern.compile("filename\\*=UTF-8''([^;]+)", Pattern.CASE_INSENSITIVE).matcher(cd);
+                          if (m.find()) return URLDecoder.decode(m.group(1), "UTF-8").replaceAll("[/\\\\]", "_");
+                          m = Pattern.compile("filename=\"?([^\";]+)\"?", Pattern.CASE_INSENSITIVE).matcher(cd);
+                          if (m.find()) return m.group(1).replaceAll("[/\\\\]", "_");
+                      }
+                  } catch (Exception ignored) {
+                  }
+                  String p = Uri.parse(url).getLastPathSegment();
+                  return p == null || p.isEmpty() ? "unduhan.bin" : p;
+              }
+
+              void download(final String url, final String cd) {
+                  new Thread(new Runnable() {
+                      @Override
+                      public void run() {
+                          try {
+                              HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+                              String ck = CookieManager.getInstance().getCookie(url);
+                              if (ck != null) c.setRequestProperty("Cookie", ck);
+                              c.setConnectTimeout(5000);
+                              c.setReadTimeout(60000);
+                              if (c.getResponseCode() != 200) throw new Exception("HTTP " + c.getResponseCode());
+                              String name = fileName(cd, url);
+                              OutputStream out;
+                              String where;
+                              if (Build.VERSION.SDK_INT >= 29) {
+                                  ContentValues v = new ContentValues();
+                                  v.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
+                                  v.put(MediaStore.MediaColumns.MIME_TYPE, "application/octet-stream");
+                                  v.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/ServerMC");
+                                  Uri u = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
+                                  out = getContentResolver().openOutputStream(u);
+                                  where = "Download/ServerMC/" + name;
+                              } else {
+                                  File d = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+                                  out = new FileOutputStream(new File(d, name));
+                                  where = d.getPath() + "/" + name;
+                              }
+                              InputStream in = c.getInputStream();
+                              byte[] buf = new byte[65536];
+                              int n;
+                              try {
+                                  while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                              } finally {
+                                  in.close();
+                                  out.close();
+                              }
+                              toast("Tersimpan di " + where);
+                          } catch (Exception e) {
+                              toast("Gagal mengunduh: " + e.getMessage());
+                          }
+                      }
+                  }).start();
+              }
+
+              // ───────────── siklus hidup
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  ui.removeCallbacks(poll);
+                  ui.post(poll);
+              }
+
+              @Override
+              protected void onPause() {
+                  super.onPause();
+                  ui.removeCallbacks(poll);
+              }
+
+              @Override
+              protected void onActivityResult(int req, int res, Intent data) {
+                  if (req == REQ_FILE && fileCb != null) {
+                      Uri[] r = null;
+                      if (res == RESULT_OK && data != null && data.getData() != null) r = new Uri[]{data.getData()};
+                      fileCb.onReceiveValue(r);
+                      fileCb = null;
+                      return;
+                  }
+                  super.onActivityResult(req, res, data);
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (webBox.getVisibility() == View.VISIBLE) {
+                      if (web.canGoBack() && !failed) web.goBack();
+                      else showHome();
+                  } else {
+                      super.onBackPressed();
+                  }
+              }
+          }
+          __EOF_MAINACTIVITY_JAVA__
+
+          cat > app/java/id/servermc/panel/LocalServer.java <<'__EOF_LOCALSERVER_JAVA__'
+          package id.servermc.panel;
+
+          import android.content.res.AssetManager;
+
+          import java.io.BufferedReader;
+          import java.io.ByteArrayOutputStream;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.InputStreamReader;
+          import java.io.OutputStream;
+          import java.net.InetAddress;
+          import java.net.ServerSocket;
+          import java.net.Socket;
+          import java.security.MessageDigest;
+          import java.util.HashMap;
+          import java.util.Map;
+
+          /**
+           * Server kecil di 127.0.0.1 (port acak) yang menyajikan file panel ke Termux.
+           * Installer dan semua file diberi hash SHA-256 supaya app lain di HP tidak bisa menyelipkan isi palsu.
+           */
+          class LocalServer extends Thread {
+              static final String[] FILES = {"panel.py", "index.html", "app.js", "app.css"};
+
+              private final ServerSocket ss;
+              private final Map<String, byte[]> files = new HashMap<>();
+              private final String installerHash;
+
+              LocalServer(AssetManager am) throws Exception {
+                  super("asset-server");
+                  setDaemon(true);
+                  ss = new ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"));
+                  String script = new String(read(am, "i.sh"), "UTF-8").replace("@@PORT@@", String.valueOf(ss.getLocalPort()));
+                  for (String f : FILES) {
+                      byte[] d = read(am, f);
+                      files.put(f, d);
+                      script = script.replace("@@SHA_" + f.replace('.', '_') + "@@", sha(d));
+                  }
+                  byte[] inst = script.getBytes("UTF-8");
+                  files.put("i.sh", inst);
+                  installerHash = sha(inst);
+              }
+
+              /** Perintah satu baris yang ditempel di Termux. */
+              String command() {
+                  return "cd ~ && curl -fsS http://127.0.0.1:" + ss.getLocalPort() + "/i.sh -o mcsetup.sh"
+                          + " && echo \"" + installerHash + "  mcsetup.sh\" | sha256sum -c --status && bash mcsetup.sh";
+              }
+
+              @Override
+              public void run() {
+                  while (true) {
+                      try {
+                          final Socket s = ss.accept();
+                          new Thread(new Runnable() {
+                              @Override
+                              public void run() {
+                                  serve(s);
+                              }
+                          }).start();
+                      } catch (IOException e) {
+                          return;
+                      }
+                  }
+              }
+
+              private void serve(Socket s) {
+                  try {
+                      s.setSoTimeout(5000);
+                      BufferedReader r = new BufferedReader(new InputStreamReader(s.getInputStream(), "ISO-8859-1"));
+                      String line = r.readLine();
+                      String hdr;
+                      while ((hdr = r.readLine()) != null && !hdr.isEmpty()) {
+                          // header diabaikan
+                      }
+                      String name = "";
+                      if (line != null) {
+                          String[] p = line.split(" ");
+                          if (p.length > 1) {
+                              name = p[1].replaceFirst("^/", "");
+                              int q = name.indexOf('?');
+                              if (q >= 0) name = name.substring(0, q);
+                          }
+                      }
+                      byte[] body = files.get(name);
+                      OutputStream o = s.getOutputStream();
+                      if (body == null) {
+                          o.write("HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".getBytes("ISO-8859-1"));
+                      } else {
+                          o.write(("HTTP/1.0 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: "
+                                  + body.length + "\r\nConnection: close\r\n\r\n").getBytes("ISO-8859-1"));
+                          o.write(body);
+                      }
+                      o.flush();
+                  } catch (Exception ignored) {
+                      // koneksi putus, abaikan
+                  } finally {
+                      try {
+                          s.close();
+                      } catch (IOException ignored) {
+                      }
+                  }
+              }
+
+              private static byte[] read(AssetManager am, String name) throws IOException {
+                  InputStream in = am.open(name);
+                  try {
+                      ByteArrayOutputStream o = new ByteArrayOutputStream();
+                      byte[] b = new byte[8192];
+                      int n;
+                      while ((n = in.read(b)) > 0) o.write(b, 0, n);
+                      return o.toByteArray();
+                  } finally {
+                      in.close();
+                  }
+              }
+
+              private static String sha(byte[] d) throws Exception {
+                  StringBuilder sb = new StringBuilder();
+                  for (byte x : MessageDigest.getInstance("SHA-256").digest(d)) sb.append(String.format("%02x", x));
+                  return sb.toString();
+              }
+          }
+          __EOF_LOCALSERVER_JAVA__
+
+          cat > app/assets/i.sh <<'__EOF_I_SH__'
+          #!/bin/bash
+          # Pemasang Server MC untuk Termux.
+          # File ini dibuat oleh aplikasi Server MC. Hash-nya sudah dicek sebelum dijalankan.
+          set -eo pipefail
+
+          PORT=@@PORT@@
+          say() { printf '\n\033[1;32m==> %s\033[0m\n' "$*"; }
+          die() { printf '\n\033[1;31mGAGAL: %s\033[0m\n' "$*" >&2; exit 1; }
+          ask() { local a=""; read -r -p "$1" a </dev/tty || true; printf '%s' "$a"; }
+
+          [ -n "${PREFIX:-}" ] && [ -x "$PREFIX/bin/pkg" ] || die "Jalankan perintah ini di aplikasi Termux (versi F-Droid atau GitHub)."
+          export MC_HOME="${MC_HOME:-$HOME/minecraft}"
+          P="$MC_HOME/panel/panel.py"
+
+          say "1/6  Memperbarui Termux dan memasang paket dasar (bisa beberapa menit)"
+          pkg update -y
+          pkg upgrade -y -o Dpkg::Options::="--force-confnew"
+          pkg install -y python tmux proot resolv-conf curl coreutils
+
+          say "2/6  Mengambil file panel dari aplikasi Server MC"
+          mkdir -p "$MC_HOME/panel/static" "$MC_HOME/server" "$MC_HOME/backups" "$MC_HOME/tunnel"
+          fetch() { # nama-file tujuan sha256
+            curl -fsS "http://127.0.0.1:$PORT/$1" -o "$2.new" \
+              || die "Tidak bisa mengambil $1 dari aplikasi Server MC. Buka aplikasinya lagi (jangan ditutup), salin perintah baru, lalu jalankan lagi."
+            echo "$3  $2.new" | sha256sum -c --status || { rm -f "$2.new"; die "File $1 rusak atau berubah (hash tidak cocok)."; }
+            mv -f "$2.new" "$2"
+          }
+          fetch panel.py "$P" @@SHA_panel_py@@
+          fetch index.html "$MC_HOME/panel/static/index.html" @@SHA_index_html@@
+          fetch app.js "$MC_HOME/panel/static/app.js" @@SHA_app_js@@
+          fetch app.css "$MC_HOME/panel/static/app.css" @@SHA_app_css@@
+          python3 "$P" init
+
+          say "3/6  Pengaturan awal"
+          if python3 "$P" config | grep -q '"contact": ""'; then
+            C="${MC_CONTACT:-}"
+            [ -n "$C" ] || C="$(ask 'Email atau URL kontakmu (wajib oleh PaperMC, hanya dikirim ke PaperMC): ')"
+            [ -n "$C" ] || die "Kontak tidak boleh kosong."
+            python3 "$P" config set contact "$C"
+          fi
+          EULA=no
+          if [ -f "$MC_HOME/server/eula.txt" ] && grep -qi '^eula=true' "$MC_HOME/server/eula.txt"; then
+            EULA=yes
+          else
+            echo "Server Minecraft butuh persetujuan EULA: https://aka.ms/MinecraftEULA"
+            A="${MC_ACCEPT_EULA:-}"
+            [ -n "$A" ] || A="$(ask 'Kamu setuju dengan EULA itu? (y/N) ')"
+            case "$A" in [YyJj]*) python3 "$P" eula; EULA=yes ;; esac
+          fi
+
+          say "4/6  Mengunduh Paper (server Java)"
+          OUT="$(python3 "$P" install-paper)" || die "Gagal mengunduh Paper. Cek internet, lalu jalankan perintah ini lagi."
+          echo "$OUT"
+          JM="$(echo "$OUT" | sed -n 's/^JAVA_MAJOR=//p')"
+          [ -n "$JM" ] || JM=21
+
+          say "5/6  Memasang Java $JM"
+          pkg install -y "openjdk-$JM" || die "Paket openjdk-$JM tidak ketemu. Coba: pkg search openjdk"
+
+          say "6/6  Memasang Geyser dan Floodgate (agar pemain Bedrock bisa join)"
+          python3 "$P" install-geyser || echo "Geyser gagal diunduh. Bisa dicoba lagi dari panel, tab Bedrock."
+
+          PW="$(python3 "$P" passwd --init)"
+
+          mkdir -p "$PREFIX/bin"
+          cat > "$PREFIX/bin/mc" <<'MCEOF'
+          #!/bin/bash
+          export MC_HOME="${MC_HOME:-$HOME/minecraft}"
+          PY="$MC_HOME/panel/panel.py"
+          S=mc-panel
+          panel_alive() { [ "$(tmux list-panes -t "=$S:" -F '#{pane_dead}' 2>/dev/null | head -n1)" = "0" ]; }
+          panel_port() { python3 "$PY" config | sed -n 's/.*"port": \([0-9]*\).*/\1/p'; }
+          panel_start() {
+            if panel_alive; then echo "Panel sudah jalan di http://localhost:$(panel_port)"; return 0; fi
+            tmux kill-session -t "=$S" 2>/dev/null || true
+            tmux new-session -d -s "$S" -c "$MC_HOME" "exec python3 '$PY' serve" \; set-window-option -t "=$S:" remain-on-exit on
+            sleep 2
+            if panel_alive; then
+              echo "Panel jalan di http://localhost:$(panel_port)"
+            else
+              tmux capture-pane -p -t "=$S:" 2>/dev/null | tail -n 8
+              tmux kill-session -t "=$S" 2>/dev/null || true
+              echo "Panel gagal jalan."
+              return 1
+            fi
+          }
+          case "${1:-help}" in
+            start) panel_start; python3 "$PY" server start ;;
+            stop|restart|kill|status) python3 "$PY" server "$1" ;;
+            console) echo "Untuk keluar dari konsol tanpa mematikan server: tekan Ctrl+B lalu D"; sleep 1; exec tmux attach -t "=mc-server" ;;
+            panel)
+              case "${2:-start}" in
+                start) panel_start ;;
+                stop) tmux kill-session -t "=$S" 2>/dev/null && echo "Panel dihentikan" || echo "Panel tidak jalan" ;;
+                restart) tmux kill-session -t "=$S" 2>/dev/null || true; sleep 1; panel_start ;;
+                *) echo "Pakai: mc panel [start|stop|restart]" ;;
+              esac ;;
+            passwd) shift; python3 "$PY" passwd "$@" ;;
+            update) shift; python3 "$PY" install-paper "$@" ;;
+            geyser) python3 "$PY" install-geyser ;;
+            backup) python3 "$PY" backup ;;
+            tunnel) shift; python3 "$PY" tunnel "${1:-show}" ;;
+            config) shift; python3 "$PY" config "$@" ;;
+            lan) python3 "$PY" config set bind 0.0.0.0; "$0" panel restart; echo "Panel bisa dibuka dari Wi-Fi: http://IP-HP:$(panel_port) (pakai password)" ;;
+            local) python3 "$PY" config set bind 127.0.0.1; "$0" panel restart ;;
+            *)
+              cat <<'HELP'
+          Server MC, perintah:
+            mc start            nyalakan panel dan server
+            mc stop             matikan server dengan aman
+            mc restart          mulai ulang server
+            mc status           lihat status server
+            mc console          buka konsol server (keluar: Ctrl+B lalu D)
+            mc kill             paksa matikan server
+            mc panel [start|stop|restart]   kelola panel web
+            mc backup           buat backup sekarang
+            mc update [versi]   perbarui atau ganti versi Paper
+            mc geyser           perbarui Geyser dan Floodgate
+            mc tunnel [start|stop|show|install]   tunnel playit.gg
+            mc passwd [baru]    ganti password panel
+            mc lan | mc local   buka panel ke Wi-Fi | hanya di HP ini
+            mc config           lihat pengaturan
+          HELP
+              ;;
+          esac
+          MCEOF
+          chmod +x "$PREFIX/bin/mc"
+
+          # panel menyala otomatis setiap Termux dibuka
+          touch "$HOME/.bashrc"
+          if ! grep -q 'server-mc autostart' "$HOME/.bashrc"; then
+            cat >> "$HOME/.bashrc" <<'RCEOF'
+          # server-mc autostart: nyalakan panel saat Termux dibuka
+          command -v mc >/dev/null 2>&1 && mc panel start >/dev/null 2>&1 || true
+          RCEOF
+          fi
+
+          if command -v termux-wake-lock >/dev/null 2>&1; then termux-wake-lock || true; fi
+          PANEL_OK=no
+          if mc panel start; then PANEL_OK=yes; fi
+          SERVER_OK=no
+          if [ "$EULA" = yes ] && mc start; then SERVER_OK=yes; fi
+
+          PANEL_PORT="$(python3 "$P" config | sed -n 's/.*"port": \([0-9]*\).*/\1/p')"
+          echo
+          echo "================================================================"
+          echo " Selesai. Server MC terpasang di $MC_HOME"
+          echo "================================================================"
+          if [ "$PANEL_OK" = yes ]; then
+            echo " Panel     : http://localhost:$PANEL_PORT (buka lewat aplikasi Server MC, tombol 3)"
+          else
+            echo " Panel     : BELUM JALAN. Tutup Termux, buka lagi, lalu ketik: mc panel start"
+          fi
+          if [ -n "$PW" ]; then echo " Password  : $PW   (ganti nanti dengan: mc passwd)"; fi
+          if [ "$SERVER_OK" = yes ]; then
+            echo " Server    : sedang dinyalakan. Start pertama butuh beberapa menit (membuat dunia)."
+          elif [ "$EULA" = yes ]; then
+            echo " Server    : GAGAL dinyalakan. Coba ketik: mc start"
+          else
+            echo " Server    : belum jalan karena EULA belum disetujui. Setujui di panel, menu Pengaturan."
+          fi
+          echo " Bedrock   : alamat IP HP, port 19132 (UDP), lewat Geyser."
+          echo " Penting   : matikan penghemat baterai untuk Termux agar server tidak dimatikan Android."
+          echo " Bantuan   : ketik: mc help"
+          __EOF_I_SH__
+
+          cat > app/assets/panel.py <<'__EOF_PANEL_PY__'
+          #!/usr/bin/env python3
+          """Panel server Minecraft untuk Termux (Paper + Geyser/Floodgate). Hanya pakai library bawaan Python."""
+          import os, sys, re, json, time, shlex, shutil, socket, hashlib, hmac, secrets, tarfile, zipfile, platform
+          import threading, subprocess, traceback, urllib.request, urllib.parse, urllib.error
+          from collections import deque
+          from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+          from pathlib import Path
+
+          VERSION = "1.0"
+          HOME = Path(os.environ.get("MC_HOME") or (Path.home() / "minecraft")).resolve()
+          SERVER, PANEL, BACKUPS, TUNNEL = HOME / "server", HOME / "panel", HOME / "backups", HOME / "tunnel"
+          STATIC, CFG_FILE, STATE_FILE = PANEL / "static", PANEL / "config.json", PANEL / "state.json"
+          S_SRV, S_TUN = "mc-server", "mc-tunnel"
+          PAPER_API = os.environ.get("MC_PAPER_API", "https://fill.papermc.io/v3/projects/paper")
+          MR_API = os.environ.get("MC_MODRINTH_API", "https://api.modrinth.com/v2")
+          GEYSER_API = os.environ.get("MC_GEYSER_API", "https://download.geysermc.org/v2/projects")
+          PLAYIT_URL = os.environ.get("MC_PLAYIT_URL", "https://github.com/playit-cloud/playit-agent/releases/latest/download")
+          GENERIC_UA = "termux-mc-panel/" + VERSION
+
+
+          class ApiError(Exception):
+              def __init__(self, code, msg):
+                  super().__init__(msg)
+                  self.code, self.msg = code, msg
+
+
+          # ───────────────────────── konfigurasi ─────────────────────────
+          DEFAULTS = {"port": 8080, "bind": "127.0.0.1", "ram_mb": 0, "jvm_flags": "-XX:+DisableExplicitGC -Dfile.encoding=UTF-8",
+                      "java": "", "contact": "", "auto_restart": True, "backup_every_h": 0, "backup_keep": 5,
+                      "upload_max_mb": 512, "pw_hash": "", "pw_salt": ""}
+          SETTABLE = {"ram_mb": int, "jvm_flags": str, "contact": str, "auto_restart": bool, "backup_every_h": int,
+                      "backup_keep": int, "bind": str, "java": str, "port": int, "upload_max_mb": int}
+
+
+          def read_text(p, default=""):
+              try:
+                  return Path(p).read_text("utf-8", "replace")
+              except Exception:
+                  return default
+
+
+          def to_int(x, d):
+              try:
+                  return int(str(x).strip())
+              except Exception:
+                  return d
+
+
+          def meminfo():
+              d = {}
+              try:
+                  for l in open("/proc/meminfo"):
+                      k, v = l.split(":", 1)
+                      d[k] = int(v.split()[0]) // 1024
+              except Exception:
+                  pass
+              return d
+
+
+          def load_cfg():
+              try:
+                  d = json.loads(CFG_FILE.read_text())
+              except Exception:
+                  d = {}
+              c = {**DEFAULTS, **d}
+              if not c["ram_mb"]:
+                  tot = meminfo().get("MemTotal", 4096)
+                  c["ram_mb"] = max(768, min(int(tot * 0.45) // 256 * 256, 4096))
+              return c
+
+
+          def save_cfg(c):
+              PANEL.mkdir(parents=True, exist_ok=True)
+              tmp = CFG_FILE.with_suffix(".tmp")
+              tmp.write_text(json.dumps(c, indent=2))
+              os.chmod(tmp, 0o600)
+              os.replace(tmp, CFG_FILE)
+
+
+          def apply_settings(d):
+              c = load_cfg()
+              for k, v in d.items():
+                  if k not in SETTABLE:
+                      continue
+                  t = SETTABLE[k]
+                  if t is bool:
+                      v = v if isinstance(v, bool) else str(v).lower() in ("1", "true", "yes", "on")
+                  elif t is int:
+                      v = to_int(v, None)
+                      if v is None:
+                          raise ApiError(400, f"'{k}' harus berupa angka")
+                  else:
+                      v = str(v).strip()
+                  if k == "ram_mb" and not 256 <= v <= 65536:
+                      raise ApiError(400, "RAM harus antara 256 dan 65536 MB")
+                  if k == "bind" and v not in ("127.0.0.1", "0.0.0.0"):
+                      raise ApiError(400, "bind harus 127.0.0.1 atau 0.0.0.0")
+                  if k == "port" and not 1024 <= v <= 65535:
+                      raise ApiError(400, "Port panel harus 1024-65535")
+                  if k in ("backup_every_h", "backup_keep", "upload_max_mb") and v < 0:
+                      raise ApiError(400, f"'{k}' tidak boleh negatif")
+                  if k == "jvm_flags":
+                      try:
+                          shlex.split(v)
+                      except ValueError:
+                          raise ApiError(400, "JVM flags tidak valid (tanda kutip tidak berpasangan)")
+                  c[k] = v
+              save_cfg(c)
+              return c
+
+
+          def hash_pw(pw, salt):
+              return hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), 200_000).hex()
+
+
+          def set_password(pw):
+              c = load_cfg()
+              c["pw_salt"] = secrets.token_hex(16)
+              c["pw_hash"] = hash_pw(pw, c["pw_salt"])
+              save_cfg(c)
+
+
+          def check_password(pw):
+              c = load_cfg()
+              return bool(c["pw_hash"]) and hmac.compare_digest(hash_pw(pw, c["pw_salt"]), c["pw_hash"])
+
+
+          def get_desired():
+              try:
+                  return bool(json.loads(STATE_FILE.read_text()).get("desired"))
+              except Exception:
+                  return False
+
+
+          def set_desired(v):
+              PANEL.mkdir(parents=True, exist_ok=True)
+              STATE_FILE.write_text(json.dumps({"desired": bool(v)}))
+
+
+          # ───────────────────────── unduhan ─────────────────────────
+          def http_open(url, ua, timeout=30):
+              return urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": ua, "Accept": "application/json, */*"}), timeout=timeout)
+
+
+          def get_json(url, ua):
+              with http_open(url, ua) as r:
+                  return json.load(r)
+
+
+          def download(url, dest, ua, sha256=None, sha512=None):
+              dest = Path(dest)
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              tmp = dest.with_name(dest.name + ".part")
+              a, b = hashlib.sha256(), hashlib.sha512()
+              try:
+                  with http_open(url, ua, 90) as r, open(tmp, "wb") as f:
+                      while True:
+                          ch = r.read(1 << 16)
+                          if not ch:
+                              break
+                          f.write(ch)
+                          a.update(ch)
+                          b.update(ch)
+                  if sha256 and a.hexdigest().lower() != sha256.lower():
+                      raise ApiError(502, "Checksum SHA-256 tidak cocok, unduhan dibatalkan")
+                  if sha512 and b.hexdigest().lower() != sha512.lower():
+                      raise ApiError(502, "Checksum SHA-512 tidak cocok, unduhan dibatalkan")
+                  if tmp.stat().st_size < 100:
+                      raise ApiError(502, "Hasil unduhan terlalu kecil, kemungkinan salah")
+                  os.replace(tmp, dest)
+              finally:
+                  tmp.unlink(missing_ok=True)
+
+
+          # ───────────────────────── Paper & Java ─────────────────────────
+          def vkey(v):
+              return tuple(int(x) for x in v.split("."))
+
+
+          def is_rel(v):
+              return bool(re.fullmatch(r"\d+(\.\d+)+", v))
+
+
+          def paper_ua():
+              c = load_cfg()["contact"].strip()
+              if not c:
+                  raise ApiError(400, "Isi 'Kontak' (email atau URL) di Pengaturan dulu. PaperMC mewajibkannya untuk unduhan.")
+              return f"{GENERIC_UA} ({c})"
+
+
+          def paper_versions():
+              d = get_json(PAPER_API, paper_ua())
+              vs = {v for grp in d["versions"].values() for v in grp if is_rel(v)}
+              return sorted(vs, key=vkey, reverse=True)
+
+
+          def paper_build(ver):
+              for b in get_json(f"{PAPER_API}/versions/{ver}/builds", paper_ua()):
+                  if b.get("channel") in ("STABLE", "RECOMMENDED"):
+                      return b["id"], b["downloads"]["server:default"]
+              return None
+
+
+          def java_major(v):
+              if not is_rel(v):
+                  return 21
+              t = vkey(v)
+              return 25 if t[0] >= 26 else 21 if t >= (1, 20, 5) else 17
+
+
+          def install_paper(ver=None):
+              ua, found = paper_ua(), None
+              if ver:
+                  if not is_rel(ver):
+                      raise ApiError(400, "Versi tidak valid")
+                  found = paper_build(ver)
+                  if not found:
+                      raise ApiError(404, f"Paper {ver} belum punya build stabil")
+              else:
+                  for v in paper_versions():
+                      found = paper_build(v)
+                      if found:
+                          ver = v
+                          break
+                  if not found:
+                      raise ApiError(502, "Tidak ada build Paper stabil yang ketemu")
+              bid, dl = found
+              SERVER.mkdir(parents=True, exist_ok=True)
+              dest = SERVER / "paper.jar"
+              if dest.exists():
+                  shutil.copy2(dest, SERVER / "paper.jar.bak")
+              download(dl["url"], dest, ua, sha256=(dl.get("checksums") or {}).get("sha256"))
+              (SERVER / ".mcversion").write_text(ver)
+              (SERVER / ".paperbuild").write_text(str(bid))
+              return {"version": ver, "build": bid, "java": java_major(ver)}
+
+
+          def java_bin(major=None):
+              c = load_cfg()
+              if c["java"]:
+                  return c["java"]
+              pre = os.environ.get("PREFIX", "")
+              if major and pre:
+                  p = Path(pre) / f"lib/jvm/java-{major}-openjdk/bin/java"
+                  if p.exists():
+                      return str(p)
+              return shutil.which("java") or "java"
+
+
+          def eula_ok():
+              return bool(re.search(r"(?mi)^\s*eula\s*=\s*true", read_text(SERVER / "eula.txt")))
+
+
+          # ───────────────────────── tmux & status server ─────────────────────────
+          def tmux(*a):
+              try:
+                  return subprocess.run(["tmux", *a], capture_output=True, text=True, timeout=20)
+              except FileNotFoundError:
+                  raise ApiError(500, "tmux belum terpasang. Jalankan: pkg install tmux")
+
+
+          def pane_info(sess):
+              r = tmux("list-panes", "-t", f"={sess}:", "-F", "#{pane_pid}|#{pane_dead}|#{session_created}|#{pane_dead_status}")
+              if r.returncode or not r.stdout.strip():
+                  return None
+              a = r.stdout.strip().splitlines()[0].split("|")
+              return {"pid": int(a[0]), "dead": a[1] == "1", "since": int(a[2]), "code": a[3] if len(a) > 3 else ""}
+
+
+          RE_JOIN = re.compile(r"\]: ([A-Za-z0-9_.\-]{1,40}) joined the game")
+          RE_LEFT = re.compile(r"\]: ([A-Za-z0-9_.\-]{1,40}) left the game")
+          RE_DONE = re.compile(r"\]: Done \([\d.,]+s\)!")
+          RE_STOP = re.compile(r"\]: Stopping (?:the )?server")
+
+
+          class LogTailer(threading.Thread):
+              """Membaca logs/latest.log terus-menerus: konsol, daftar pemain, status 'sudah siap'."""
+              def __init__(self):
+                  super().__init__(daemon=True)
+                  self.lock = threading.Lock()
+                  self.buf, self.next_id = deque(maxlen=3000), 1
+                  self.online, self.done, self.stopping = set(), False, False
+                  self.ino, self.off, self.partial, self.first = None, 0, b"", True
+
+              def note(self, text):
+                  self._add(text)
+
+              def _add(self, line):
+                  with self.lock:
+                      self.buf.append((self.next_id, line))
+                      self.next_id += 1
+
+              def feed(self, line):
+                  self._add(line)
+                  with self.lock:
+                      m = RE_JOIN.search(line)
+                      if m:
+                          self.online.add(m.group(1))
+                      m = RE_LEFT.search(line)
+                      if m:
+                          self.online.discard(m.group(1))
+                      if RE_DONE.search(line):
+                          self.done = True
+                      if RE_STOP.search(line):
+                          self.stopping = True
+
+              def flags(self):
+                  with self.lock:
+                      return {"done": self.done, "stopping": self.stopping}
+
+              def players(self):
+                  with self.lock:
+                      return sorted(self.online)
+
+              def since(self, n):
+                  with self.lock:
+                      items = [(i, l) for i, l in self.buf if i > n] if n else list(self.buf)[-300:]
+                      return items, self.next_id - 1
+
+              def last_id(self):
+                  with self.lock:
+                      return self.next_id - 1
+
+              def wait_for(self, text, after, timeout):
+                  end = time.time() + timeout
+                  while time.time() < end:
+                      with self.lock:
+                          if any(i > after and text in l for i, l in self.buf):
+                              return True
+                      time.sleep(0.3)
+                  return False
+
+              def poll_once(self):
+                  """Satu putaran baca log. Mengembalikan True kalau masih ada data yang belum terbaca."""
+                  path = SERVER / "logs" / "latest.log"
+                  more = False
+                  try:
+                      st = os.stat(path)
+                      if self.ino != st.st_ino or st.st_size < self.off:
+                          self.ino, self.off, self.partial = st.st_ino, 0, b""
+                          with self.lock:
+                              self.online, self.done, self.stopping = set(), False, False
+                          if not self.first:
+                              self._add("─── log baru (server dimulai ulang) ───")
+                          if st.st_size > 2_000_000:  # log besar: lompat ke ekor, anggap server sudah siap
+                              self.off = st.st_size - 400_000
+                              self.partial = b"\x00"
+                              self.done = True
+                          self.first = False
+                      if st.st_size > self.off:
+                          with open(path, "rb") as f:
+                              f.seek(self.off)
+                              data = f.read(1 << 20)
+                          self.off += len(data)
+                          parts = (self.partial + data).split(b"\n")
+                          self.partial = parts.pop()
+                          for raw in parts:
+                              if raw.startswith(b"\x00"):
+                                  continue
+                              self.feed(raw.decode("utf-8", "replace").rstrip("\r"))
+                          more = st.st_size > self.off
+                  except FileNotFoundError:
+                      pass
+                  except Exception:
+                      traceback.print_exc()
+                  return more
+
+              def run(self):
+                  while True:
+                      if not self.poll_once():
+                          time.sleep(0.7)
+
+
+          TAILER = LogTailer()
+
+
+          def server_state():
+              pi = pane_info(S_SRV)
+              if not pi or pi["dead"]:
+                  return {"state": "stopped", "pid": None, "crashed": bool(pi), "code": pi["code"] if pi else ""}
+              f = TAILER.flags()
+              st = "stopping" if f["stopping"] else "running" if f["done"] else "starting"
+              return {"state": st, "pid": pi["pid"], "since": pi["since"]}
+
+
+          def server_cmd():
+              c = load_cfg()
+              ver = read_text(SERVER / ".mcversion").strip()
+              ram = int(c["ram_mb"])
+              return [java_bin(java_major(ver) if ver else None), f"-Xms{min(512, ram)}M", f"-Xmx{ram}M",
+                      *shlex.split(c["jvm_flags"]), "-jar", "paper.jar", "--nogui"]
+
+
+          def start_server():
+              if server_state()["state"] != "stopped":
+                  raise ApiError(409, "Server sudah jalan")
+              if not (SERVER / "paper.jar").exists():
+                  raise ApiError(400, "paper.jar belum ada. Pasang Paper dulu (menu Pengaturan).")
+              if not eula_ok():
+                  raise ApiError(400, "Minecraft EULA belum disetujui (menu Pengaturan).")
+              tmux("kill-session", "-t", f"={S_SRV}")
+              cmd = "exec " + " ".join(shlex.quote(x) for x in server_cmd())
+              r = tmux("new-session", "-d", "-s", S_SRV, "-x", "200", "-y", "50", "-c", str(SERVER), cmd,
+                       ";", "set-window-option", "-t", f"={S_SRV}:", "remain-on-exit", "on")
+              if r.returncode:
+                  raise ApiError(500, "Gagal menjalankan tmux: " + r.stderr.strip())
+              set_desired(True)
+              TAILER.note("[panel] Server dijalankan…")
+
+
+          def send_cmd(text):
+              text = (text or "").strip().lstrip("/")
+              if not text or len(text) > 500 or re.search(r"[\x00-\x1f\x7f]", text):
+                  raise ApiError(400, "Perintah tidak valid")
+              if server_state()["state"] == "stopped":
+                  raise ApiError(409, "Server sedang mati")
+              t = f"={S_SRV}:"
+              tmux("send-keys", "-t", t, "-l", "--", text)
+              tmux("send-keys", "-t", t, "Enter")
+
+
+          def kill_server():
+              set_desired(False)
+              tmux("kill-session", "-t", f"={S_SRV}")
+
+
+          def stop_server():
+              set_desired(False)
+              if server_state()["state"] == "stopped":
+                  return
+              try:
+                  send_cmd("stop")
+              except ApiError:
+                  pass
+
+              def killer():
+                  for _ in range(180):
+                      if server_state()["state"] == "stopped":
+                          return
+                      time.sleep(0.5)
+                  kill_server()
+              threading.Thread(target=killer, daemon=True).start()
+
+
+          def restart_server():
+              def run():
+                  try:
+                      stop_server()
+                      for _ in range(240):
+                          if server_state()["state"] == "stopped":
+                              break
+                          time.sleep(0.5)
+                      time.sleep(1)
+                      start_server()
+                  except Exception as e:
+                      TAILER.note(f"[panel] Gagal restart: {e}")
+              threading.Thread(target=run, daemon=True).start()
+
+
+          _prev = {}
+
+
+          def proc_stats(pid):
+              try:
+                  rss = 0
+                  for l in open(f"/proc/{pid}/status"):
+                      if l.startswith("VmRSS:"):
+                          rss = int(l.split()[1]) // 1024
+                  st = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()
+                  ticks, t, cpu = int(st[11]) + int(st[12]), time.time(), None
+                  p = _prev.get(pid)
+                  if p and t > p[0]:
+                      cpu = max(0, round((ticks - p[1]) / os.sysconf("SC_CLK_TCK") / (t - p[0]) * 100))
+                  _prev[pid] = (t, ticks)
+                  return {"rss_mb": rss, "cpu": cpu}
+              except Exception:
+                  return {"rss_mb": None, "cpu": None}
+
+
+          def lan_ip():
+              s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+              try:
+                  s.connect(("10.255.255.255", 1))
+                  return s.getsockname()[0]
+              except Exception:
+                  return None
+              finally:
+                  s.close()
+
+
+          # ───────────────────────── properti ─────────────────────────
+          def read_props():
+              d = {}
+              for l in read_text(SERVER / "server.properties").splitlines():
+                  l = l.strip()
+                  if l and not l.startswith("#") and "=" in l:
+                      k, v = l.split("=", 1)
+                      d[k.strip()] = v.strip()
+              return d
+
+
+          def write_props(ch):
+              for k, v in ch.items():
+                  if not re.fullmatch(r"[a-z0-9.\-]{1,60}", k) or re.search(r"[\r\n]", str(v)):
+                      raise ApiError(400, f"Properti tidak valid: {k}")
+              p = SERVER / "server.properties"
+              left, out = {k: v for k, v in ch.items()}, []
+              for l in read_text(p).splitlines():
+                  k = l.split("=", 1)[0].strip() if "=" in l and not l.lstrip().startswith("#") else None
+                  if k in left:
+                      out.append(f"{k}={left.pop(k)}")
+                  else:
+                      out.append(l)
+              out += [f"{k}={v}" for k, v in left.items()]
+              SERVER.mkdir(parents=True, exist_ok=True)
+              tmp = p.with_suffix(".tmp")
+              tmp.write_text("\n".join(out) + "\n")
+              os.replace(tmp, p)
+
+
+          # ───────────────────────── file ─────────────────────────
+          def safe_path(rel, root=None):
+              root = (root or SERVER).resolve()
+              rel = str(rel or "").lstrip("/")
+              p = (root / rel).resolve()
+              if p != root and root not in p.parents:
+                  raise ApiError(403, "Path di luar folder server tidak diizinkan")
+              return p
+
+
+          def rel_of(p):
+              return "" if p == SERVER else p.relative_to(SERVER).as_posix()
+
+
+          # ───────────────────────── plugin ─────────────────────────
+          def jar_info(p):
+              try:
+                  with zipfile.ZipFile(p) as z:
+                      names = z.namelist()
+                      for n in ("paper-plugin.yml", "plugin.yml"):
+                          if n in names:
+                              t = z.read(n).decode("utf-8", "replace")
+                              nm = re.search(r"(?m)^name:\s*['\"]?([^'\"\r\n]+)", t)
+                              vr = re.search(r"(?m)^version:\s*['\"]?([^'\"\r\n]+)", t)
+                              return {"name": nm.group(1).strip() if nm else p.name, "version": vr.group(1).strip() if vr else ""}
+              except Exception:
+                  pass
+              return {"name": p.name, "version": ""}
+
+
+          def list_plugins():
+              d = SERVER / "plugins"
+              d.mkdir(parents=True, exist_ok=True)
+              out = []
+              for p in sorted(d.iterdir(), key=lambda x: x.name.lower()):
+                  if p.is_file() and (p.name.endswith(".jar") or p.name.endswith(".jar.disabled")):
+                      out.append({"file": p.name, "enabled": p.name.endswith(".jar"), "size": p.stat().st_size, **jar_info(p)})
+              return out
+
+
+          def plugin_file(name):
+              name = os.path.basename(str(name or ""))
+              if not re.fullmatch(r"[A-Za-z0-9_.\-+() ]{1,120}\.jar(\.disabled)?", name):
+                  raise ApiError(400, "Nama plugin tidak valid")
+              p = SERVER / "plugins" / name
+              if not p.is_file():
+                  raise ApiError(404, "Plugin tidak ditemukan")
+              return p
+
+
+          def mc_version():
+              return read_text(SERVER / ".mcversion").strip()
+
+
+          def mr_search(q, compat):
+              facets = [["categories:paper", "categories:spigot", "categories:bukkit", "categories:purpur", "categories:folia"]]
+              ver = mc_version()
+              if compat and ver:
+                  facets.append([f"versions:{ver}"])
+              url = f"{MR_API}/search?" + urllib.parse.urlencode(
+                  {"query": q, "limit": 20, "index": "relevance" if q else "downloads", "facets": json.dumps(facets)})
+              return [{"id": h["project_id"], "title": h["title"], "desc": h.get("description", ""), "downloads": h.get("downloads", 0),
+                       "icon": h.get("icon_url") or "", "author": h.get("author", "")} for h in get_json(url, GENERIC_UA)["hits"]]
+
+
+          def mr_install(project, depth=0, seen=None):
+              seen = seen if seen is not None else set()
+              if project in seen:
+                  return []
+              seen.add(project)
+              ver = mc_version()
+              prm = {"loaders": json.dumps(["paper", "spigot", "bukkit", "purpur"])}
+              if ver:
+                  prm["game_versions"] = json.dumps([ver])
+              vs = get_json(f"{MR_API}/project/{urllib.parse.quote(project)}/version?" + urllib.parse.urlencode(prm), GENERIC_UA)
+              if not vs:
+                  raise ApiError(404, f"Plugin ini belum punya versi untuk Minecraft {ver or '?'}")
+              v = next((x for x in vs if x.get("version_type") == "release"), vs[0])
+              f = next((x for x in v["files"] if x.get("primary")), v["files"][0])
+              fname = os.path.basename(f["filename"])
+              host = urllib.parse.urlparse(f["url"]).hostname
+              if not fname.endswith(".jar") or not re.fullmatch(r"[A-Za-z0-9_.\-+() ]{1,120}", fname):
+                  raise ApiError(400, f"Nama file dari Modrinth tidak aman: {fname}")
+              if host != "cdn.modrinth.com" and not os.environ.get("MC_ALLOW_ANY_DL"):
+                  raise ApiError(400, f"Host unduhan tidak dikenal: {host}")
+              download(f["url"], SERVER / "plugins" / fname, GENERIC_UA, sha512=(f.get("hashes") or {}).get("sha512"))
+              done = [fname]
+              for dep in v.get("dependencies", []):
+                  if dep.get("dependency_type") == "required" and dep.get("project_id") and depth < 2:
+                      try:
+                          done += mr_install(dep["project_id"], depth + 1, seen)
+                      except Exception:
+                          pass
+              return done
+
+
+          def geyser_cfg():
+              return SERVER / "plugins" / "Geyser-Spigot" / "config.yml"
+
+
+          def geyser_port():
+              m = re.search(r"(?ms)^bedrock:.*?^\s+port:\s*(\d+)", read_text(geyser_cfg()))
+              return int(m.group(1)) if m else 19132
+
+
+          def geyser_auth():
+              m = re.search(r"(?m)^\s*auth-type:\s*(\S+)", read_text(geyser_cfg()))
+              return m.group(1) if m else None
+
+
+          def geyser_installed():
+              pl = SERVER / "plugins"
+              g = fl = False
+              if pl.is_dir():
+                  for p in pl.iterdir():
+                      n = p.name.lower()
+                      if n.endswith(".jar"):
+                          g = g or n.startswith("geyser")
+                          fl = fl or n.startswith("floodgate")
+              return {"geyser": g, "floodgate": fl}
+
+
+          def install_geyser():
+              done = []
+              for proj, fname in (("geyser", "Geyser-Spigot.jar"), ("floodgate", "floodgate-spigot.jar")):
+                  sha = None
+                  try:
+                      meta = get_json(f"{GEYSER_API}/{proj}/versions/latest/builds/latest", GENERIC_UA)
+                      sha = ((meta.get("downloads") or {}).get("spigot") or {}).get("sha256")
+                  except Exception:
+                      pass
+                  download(f"{GEYSER_API}/{proj}/versions/latest/builds/latest/downloads/spigot", SERVER / "plugins" / fname, GENERIC_UA, sha256=sha)
+                  done.append(fname)
+              return done
+
+
+          # ───────────────────────── backup ─────────────────────────
+          def backup_members(with_plugins=True):
+              ln = read_props().get("level-name") or "world"
+              keep = ("server.properties", "ops.json", "whitelist.json", "banned-players.json", "banned-ips.json",
+                      "bukkit.yml", "spigot.yml", "config", "usercache.json")
+              out = []
+              for p in sorted(SERVER.iterdir()):
+                  if p.name == ln or p.name.startswith(ln + "_") or p.name in keep or (with_plugins and p.name == "plugins"):
+                      out.append(p)
+              return out
+
+
+          def _tar_filter(ti):
+              n = ti.name
+              return None if n.endswith("session.lock") or n.endswith(".jar") or n.endswith(".jar.disabled") else ti
+
+
+          def backup_name_ok(n):
+              return bool(re.fullmatch(r"[A-Za-z0-9._\-]+\.tar\.gz", n or ""))
+
+
+          def create_backup(kind="manual", with_plugins=True):
+              BACKUPS.mkdir(parents=True, exist_ok=True)
+              running = server_state()["state"] == "running"
+              mark = TAILER.last_id()
+              if running:
+                  send_cmd("save-off")
+                  send_cmd("save-all flush")
+                  TAILER.wait_for("Saved the game", mark, 25)
+              name = f"{kind}-{time.strftime('%Y%m%d-%H%M%S')}.tar.gz"
+              try:
+                  with tarfile.open(BACKUPS / name, "w:gz") as tar:
+                      for p in backup_members(with_plugins):
+                          tar.add(p, arcname=p.relative_to(SERVER).as_posix(), filter=_tar_filter)
+              except Exception:
+                  (BACKUPS / name).unlink(missing_ok=True)
+                  raise
+              finally:
+                  if running:
+                      try:
+                          send_cmd("save-on")
+                      except ApiError:
+                          pass
+              return {"name": name, "size": (BACKUPS / name).stat().st_size}
+
+
+          def list_backups():
+              BACKUPS.mkdir(parents=True, exist_ok=True)
+              out = [{"name": p.name, "size": p.stat().st_size, "mtime": int(p.stat().st_mtime)}
+                     for p in BACKUPS.glob("*.tar.gz")]
+              return sorted(out, key=lambda x: -x["mtime"])
+
+
+          def prune_backups():
+              keep = to_int(load_cfg()["backup_keep"], 5)
+              autos = [b for b in list_backups() if b["name"].startswith("auto-")]
+              for b in autos[keep:] if keep > 0 else []:
+                  (BACKUPS / b["name"]).unlink(missing_ok=True)
+
+
+          def restore_backup(name):
+              if not backup_name_ok(name) or not (BACKUPS / name).is_file():
+                  raise ApiError(404, "Backup tidak ditemukan")
+              if server_state()["state"] != "stopped":
+                  raise ApiError(409, "Matikan server dulu sebelum restore")
+              with tarfile.open(BACKUPS / name, "r:gz") as tar:
+                  members = tar.getmembers()
+                  for m in members:
+                      if m.name.startswith("/") or ".." in Path(m.name).parts or m.issym() or m.islnk() or m.isdev():
+                          raise ApiError(400, f"Backup berisi path berbahaya: {m.name}")
+                  tops = {Path(m.name).parts[0] for m in members if Path(m.name).parts}
+                  aside = SERVER / "_before-restore"
+                  shutil.rmtree(aside, ignore_errors=True)
+                  aside.mkdir(parents=True, exist_ok=True)
+                  for t in tops:
+                      if t != "plugins" and (SERVER / t).exists():
+                          shutil.move(str(SERVER / t), str(aside / t))
+                  kw = {"filter": "data"} if hasattr(tarfile, "data_filter") else {}
+                  tar.extractall(SERVER, members=members, **kw)
+              return {"restored": sorted(tops)}
+
+
+          # ───────────────────────── tunnel playit ─────────────────────────
+          def tunnel_state():
+              pi = pane_info(S_TUN)
+              out = ""
+              if pi:
+                  r = tmux("capture-pane", "-J", "-p", "-t", f"={S_TUN}:", "-S", "-120")
+                  out = r.stdout if r.returncode == 0 else ""
+              claim = re.search(r"https://playit\.gg/[^\s\"'<>]+", out)
+              addrs = sorted(set(re.findall(r"\b[a-z0-9][a-z0-9\-.]*\.(?:joinmc\.link|ply\.gg|playit\.plus)(?::\d+)?\b", out)))
+              return {"installed": (TUNNEL / "playit").exists(), "running": bool(pi and not pi["dead"]),
+                      "claim": claim.group(0) if claim else None, "addresses": addrs, "output": out[-3000:],
+                      "chroot": bool(shutil.which("termux-chroot"))}
+
+
+          def install_playit():
+              m = platform.machine().lower()
+              names = {"aarch64": ["playit-linux-aarch64"], "arm64": ["playit-linux-aarch64"], "armv7l": ["playit-linux-armv7"],
+                       "armv8l": ["playit-linux-armv7"], "x86_64": ["playit-linux-amd64", "playit-linux-x86_64"],
+                       "amd64": ["playit-linux-amd64"]}.get(m)
+              if not names:
+                  raise ApiError(400, f"Arsitektur {m} belum didukung")
+              err = None
+              for n in names:
+                  try:
+                      download(f"{PLAYIT_URL}/{n}", TUNNEL / "playit", GENERIC_UA)
+                      os.chmod(TUNNEL / "playit", 0o755)
+                      return {"file": n}
+                  except Exception as e:
+                      err = e
+              raise ApiError(502, f"Gagal mengunduh agent playit: {err}")
+
+
+          def start_tunnel():
+              exe = TUNNEL / "playit"
+              if not exe.exists():
+                  raise ApiError(400, "Agent playit belum dipasang")
+              pi = pane_info(S_TUN)
+              if pi and not pi["dead"]:
+                  raise ApiError(409, "Tunnel sudah jalan")
+              tmux("kill-session", "-t", f"={S_TUN}")
+              cr = shutil.which("termux-chroot")
+              cmd = (shlex.quote(cr) + " " if cr else "") + shlex.quote(str(exe))
+              r = tmux("new-session", "-d", "-s", S_TUN, "-x", "200", "-y", "50", "-c", str(TUNNEL), cmd,
+                       ";", "set-window-option", "-t", f"={S_TUN}:", "remain-on-exit", "on")
+              if r.returncode:
+                  raise ApiError(500, "Gagal menjalankan tunnel: " + r.stderr.strip())
+
+
+          # ───────────────────────── watchdog ─────────────────────────
+          def watchdog():
+              restarts, last_check = [], 0
+              while True:
+                  time.sleep(5)
+                  try:
+                      c, st = load_cfg(), server_state()
+                      if st["state"] == "stopped":
+                          if st.get("crashed") and TAILER.flags()["stopping"]:
+                              set_desired(False)
+                          if get_desired() and c["auto_restart"]:
+                              restarts = [t for t in restarts if time.time() - t < 600]
+                              if len(restarts) < 3:
+                                  restarts.append(time.time())
+                                  TAILER.note("[panel] Server berhenti tiba-tiba, dijalankan ulang otomatis")
+                                  start_server()
+                              else:
+                                  set_desired(False)
+                                  TAILER.note("[panel] Server crash 3x dalam 10 menit, auto-restart dihentikan")
+                      hrs = to_int(c["backup_every_h"], 0)
+                      if hrs > 0 and time.time() - last_check > 60 and (SERVER / "paper.jar").exists():
+                          last_check = time.time()
+                          autos = [b for b in list_backups() if b["name"].startswith("auto-")]
+                          if not autos or time.time() - autos[0]["mtime"] > hrs * 3600:
+                              create_backup("auto")
+                              prune_backups()
+                  except Exception:
+                      traceback.print_exc()
+
+
+          # ───────────────────────── HTTP ─────────────────────────
+          ROUTES, SESSIONS, FAILS = {}, {}, {}
+
+
+          def route(method, path, auth=True):
+              def deco(fn):
+                  ROUTES[(method, path)] = (fn, auth)
+                  return fn
+              return deco
+
+
+          class Raw:
+              def __init__(self, code=200, body=b"", ctype="application/json", headers=None, path=None, name=None):
+                  self.code, self.body, self.ctype, self.headers, self.path, self.name = code, body, ctype, headers or [], path, name
+
+              def send(self, h):
+                  if self.path:
+                      size = self.path.stat().st_size
+                      h.send_response(200)
+                      h.send_header("Content-Type", "application/octet-stream")
+                      h.send_header("Content-Length", str(size))
+                      h.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + urllib.parse.quote(self.name or self.path.name))
+                      h.send_header("X-Content-Type-Options", "nosniff")
+                      h.end_headers()
+                      with open(self.path, "rb") as f:
+                          shutil.copyfileobj(f, h.wfile, 1 << 16)
+                  else:
+                      h._send(self.code, self.body, self.ctype, self.headers)
+
+
+          class Ctx:
+              def __init__(self, h, q, body):
+                  self.h, self.q, self.body = h, q, body
+
+
+          CSP = ("default-src 'self'; img-src 'self' https://cdn.modrinth.com data:; style-src 'self' 'unsafe-inline'; "
+                 "script-src 'self'; frame-ancestors 'none'")
+
+
+          class H(BaseHTTPRequestHandler):
+              server_version = "McPanel"
+              protocol_version = "HTTP/1.0"
+
+              def log_message(self, *a):
+                  pass
+
+              def _send(self, code, body=b"", ctype="application/json", extra=None):
+                  self.send_response(code)
+                  self.send_header("Content-Type", ctype)
+                  self.send_header("Content-Length", str(len(body)))
+                  self.send_header("Cache-Control", "no-store")
+                  self.send_header("X-Content-Type-Options", "nosniff")
+                  self.send_header("Content-Security-Policy", CSP)
+                  for k, v in extra or []:
+                      self.send_header(k, v)
+                  self.end_headers()
+                  if body and self.command != "HEAD":
+                      self.wfile.write(body)
+
+              def _json(self, code, obj):
+                  self._send(code, json.dumps(obj).encode())
+
+              def _host_ok(self):
+                  if load_cfg()["bind"] != "127.0.0.1":
+                      return True
+                  host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
+                  return host in ("localhost", "127.0.0.1", "::1")
+
+              def _authed(self):
+                  m = re.search(r"(?:^|;\s*)mcp=([A-Za-z0-9_\-]+)", self.headers.get("Cookie", ""))
+                  t = m and SESSIONS.get(m.group(1))
+                  return bool(t and t > time.time())
+
+              def _static(self, path):
+                  if path == "/favicon.ico":
+                      return self._send(204)
+                  name = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/app.css": "app.css"}.get(path)
+                  p = STATIC / name if name else None
+                  if not p or not p.is_file():
+                      return self._send(404, b"Tidak ketemu", "text/plain; charset=utf-8")
+                  ct = {"html": "text/html; charset=utf-8", "js": "text/javascript; charset=utf-8", "css": "text/css; charset=utf-8"}[name.rsplit(".", 1)[1]]
+                  self._send(200, p.read_bytes(), ct)
+
+              def handle_any(self):
+                  try:
+                      u = urllib.parse.urlsplit(self.path)
+                      q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
+                      if not self._host_ok():
+                          return self._json(403, {"error": "Host tidak diizinkan"})
+                      if not u.path.startswith("/api/"):
+                          return self._static(u.path)
+                      r = ROUTES.get((self.command, u.path))
+                      if not r:
+                          return self._json(404, {"error": "Endpoint tidak ada"})
+                      fn, auth = r
+                      if auth and not self._authed():
+                          return self._json(401, {"error": "Belum login"})
+                      if self.command != "GET" and self.headers.get("X-Panel") != "1":
+                          return self._json(403, {"error": "Permintaan ditolak (header X-Panel hilang)"})
+                      body = {}
+                      if self.command == "POST":
+                          n = to_int(self.headers.get("Content-Length"), 0)
+                          if n > 5_000_000:
+                              raise ApiError(413, "Isi permintaan terlalu besar")
+                          raw = self.rfile.read(n) if n else b""
+                          body = json.loads(raw) if raw else {}
+                          if not isinstance(body, dict):
+                              raise ApiError(400, "JSON harus berupa objek")
+                      res = fn(Ctx(self, q, body))
+                      if isinstance(res, Raw):
+                          return res.send(self)
+                      self._json(200, res if res is not None else {"ok": True})
+                  except ApiError as e:
+                      self._json(e.code, {"error": e.msg})
+                  except urllib.error.HTTPError as e:
+                      self._json(502, {"error": f"Server luar menjawab {e.code}: {e.url}"})
+                  except urllib.error.URLError as e:
+                      self._json(502, {"error": f"Tidak bisa terhubung ke server luar (cek internet): {e.reason}"})
+                  except (json.JSONDecodeError, UnicodeDecodeError):
+                      self._json(400, {"error": "JSON tidak valid"})
+                  except (BrokenPipeError, ConnectionResetError):
+                      pass
+                  except Exception as e:
+                      traceback.print_exc()
+                      try:
+                          self._json(500, {"error": f"Error internal: {e}"})
+                      except Exception:
+                          pass
+
+              do_GET = do_POST = do_PUT = do_HEAD = handle_any
+
+
+          class Srv(ThreadingHTTPServer):
+              daemon_threads = True
+              allow_reuse_address = True
+
+
+          # ── rute: sesi
+          @route("GET", "/api/session", auth=False)
+          def api_session(c):
+              return {"authed": c.h._authed(), "configured": bool(load_cfg()["pw_hash"])}
+
+
+          @route("POST", "/api/login", auth=False)
+          def api_login(c):
+              ip = c.h.client_address[0]
+              f = FAILS.get(ip, [0, 0])
+              if f[1] > time.time():
+                  raise ApiError(429, "Terlalu banyak percobaan. Tunggu 30 detik.")
+              if not check_password(str(c.body.get("password", ""))):
+                  f[0] += 1
+                  if f[0] >= 5:
+                      f = [0, time.time() + 30]
+                  FAILS[ip] = f
+                  raise ApiError(401, "Password salah")
+              FAILS.pop(ip, None)
+              tok = secrets.token_urlsafe(32)
+              SESSIONS[tok] = time.time() + 30 * 86400
+              return Raw(200, b'{"ok":true}', headers=[("Set-Cookie", f"mcp={tok}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000")])
+
+
+          @route("POST", "/api/logout")
+          def api_logout(c):
+              m = re.search(r"mcp=([A-Za-z0-9_\-]+)", c.h.headers.get("Cookie", ""))
+              if m:
+                  SESSIONS.pop(m.group(1), None)
+              return {"ok": True}
+
+
+          # ── rute: status & kontrol
+          @route("GET", "/api/status")
+          def api_status(c):
+              cf, st, pr, mem = load_cfg(), server_state(), read_props(), meminfo()
+              out = {"state": st["state"], "pid": st.get("pid"), "crashed": st.get("crashed", False),
+                     "uptime": int(time.time() - st["since"]) if st.get("since") else 0,
+                     "players": TAILER.players() if st["state"] in ("running", "stopping") else [],
+                     "max_players": to_int(pr.get("max-players"), 20), "mc_version": mc_version(),
+                     "paper_build": read_text(SERVER / ".paperbuild").strip(), "java_port": to_int(pr.get("server-port"), 25565),
+                     "bedrock_port": geyser_port(), "lan_ip": lan_ip(), "mem_total": mem.get("MemTotal"), "mem_avail": mem.get("MemAvailable"),
+                     "ram_mb": cf["ram_mb"], "disk_free_mb": shutil.disk_usage(HOME).free // 1048576,
+                     "paper_installed": (SERVER / "paper.jar").exists(), "eula": eula_ok(), "geyser": geyser_installed(),
+                     "contact_set": bool(cf["contact"].strip()), "motd": pr.get("motd", ""), "crash_log": ""}
+              if st.get("pid"):
+                  out.update(proc_stats(st["pid"]))
+              elif st.get("crashed"):
+                  r = tmux("capture-pane", "-J", "-p", "-t", f"={S_SRV}:", "-S", "-25")
+                  out["crash_log"] = "\n".join(l for l in r.stdout.splitlines() if l.strip())[-1500:] if r.returncode == 0 else ""
+              return out
+
+
+          @route("POST", "/api/server/start")
+          def api_start(c):
+              start_server()
+
+
+          @route("POST", "/api/server/stop")
+          def api_stop(c):
+              stop_server()
+
+
+          @route("POST", "/api/server/restart")
+          def api_restart(c):
+              restart_server()
+
+
+          @route("POST", "/api/server/kill")
+          def api_kill(c):
+              kill_server()
+
+
+          @route("POST", "/api/server/command")
+          def api_command(c):
+              send_cmd(str(c.body.get("cmd", "")))
+
+
+          @route("GET", "/api/console")
+          def api_console(c):
+              items, nxt = TAILER.since(to_int(c.q.get("since"), 0))
+              return {"lines": items, "next": nxt}
+
+
+          NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,40}$")
+          ACTIONS = {"kick": "kick {n}", "op": "op {n}", "deop": "deop {n}", "ban": "ban {n}", "pardon": "pardon {n}",
+                     "wl-add": "whitelist add {n}", "wl-remove": "whitelist remove {n}"}
+
+
+          @route("POST", "/api/players/action")
+          def api_player(c):
+              a, n = c.body.get("action"), str(c.body.get("name", ""))
+              if a not in ACTIONS or not NAME_RE.match(n):
+                  raise ApiError(400, "Aksi atau nama pemain tidak valid")
+              send_cmd(ACTIONS[a].format(n=n))
+
+
+          @route("GET", "/api/props")
+          def api_props(c):
+              return {"props": read_props()}
+
+
+          @route("POST", "/api/props")
+          def api_props_save(c):
+              ch = c.body.get("changes")
+              if not isinstance(ch, dict):
+                  raise ApiError(400, "Data tidak valid")
+              write_props({str(k): str(v) for k, v in ch.items()})
+
+
+          # ── rute: plugin
+          @route("GET", "/api/plugins")
+          def api_plugins(c):
+              return {"plugins": list_plugins(), "mc_version": mc_version()}
+
+
+          @route("POST", "/api/plugins/toggle")
+          def api_plugin_toggle(c):
+              p = plugin_file(c.body.get("file"))
+              new = p.with_name(p.name[:-9] if p.name.endswith(".disabled") else p.name + ".disabled")
+              p.rename(new)
+              return {"file": new.name}
+
+
+          @route("POST", "/api/plugins/delete")
+          def api_plugin_delete(c):
+              plugin_file(c.body.get("file")).unlink()
+
+
+          @route("GET", "/api/plugins/search")
+          def api_plugin_search(c):
+              return {"hits": mr_search(c.q.get("q", "").strip(), c.q.get("compat", "1") == "1")}
+
+
+          @route("POST", "/api/plugins/install")
+          def api_plugin_install(c):
+              pid = str(c.body.get("project", ""))
+              if not re.fullmatch(r"[A-Za-z0-9_\-]{2,40}", pid):
+                  raise ApiError(400, "ID proyek tidak valid")
+              return {"installed": mr_install(pid)}
+
+
+          # ── rute: file
+          @route("GET", "/api/files")
+          def api_files(c):
+              p = safe_path(c.q.get("path", ""))
+              if not p.is_dir():
+                  raise ApiError(400, "Bukan folder")
+              items = []
+              for e in sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
+                  try:
+                      s = e.stat()
+                      items.append({"name": e.name, "dir": e.is_dir(), "size": s.st_size, "mtime": int(s.st_mtime)})
+                  except OSError:
+                      pass
+              return {"path": rel_of(p), "items": items}
+
+
+          @route("GET", "/api/files/read")
+          def api_file_read(c):
+              p = safe_path(c.q.get("path", ""))
+              if not p.is_file():
+                  raise ApiError(404, "File tidak ditemukan")
+              if p.stat().st_size > 1_000_000:
+                  raise ApiError(413, "File lebih dari 1 MB, tidak bisa diedit di sini. Unduh saja.")
+              b = p.read_bytes()
+              if b"\0" in b:
+                  raise ApiError(415, "File biner, tidak bisa diedit sebagai teks")
+              return {"content": b.decode("utf-8", "replace")}
+
+
+          @route("POST", "/api/files/write")
+          def api_file_write(c):
+              p = safe_path(c.body.get("path", ""))
+              if p.is_dir() or not p.parent.is_dir():
+                  raise ApiError(400, "Tujuan tidak valid")
+              tmp = p.with_name(p.name + ".tmp")
+              tmp.write_text(str(c.body.get("content", "")), "utf-8")
+              os.replace(tmp, p)
+
+
+          @route("POST", "/api/files/mkdir")
+          def api_mkdir(c):
+              safe_path(c.body.get("path", "")).mkdir(parents=True, exist_ok=False)
+
+
+          @route("POST", "/api/files/delete")
+          def api_file_delete(c):
+              p = safe_path(c.body.get("path", ""))
+              if p == SERVER.resolve():
+                  raise ApiError(400, "Folder server utama tidak boleh dihapus")
+              if p.is_dir() and not p.is_symlink():
+                  shutil.rmtree(p)
+              else:
+                  p.unlink()
+
+
+          @route("POST", "/api/files/rename")
+          def api_file_rename(c):
+              a, b = safe_path(c.body.get("path", "")), safe_path(c.body.get("to", ""))
+              if a == SERVER.resolve() or b.exists():
+                  raise ApiError(400, "Tujuan sudah ada atau tidak valid")
+              a.rename(b)
+
+
+          @route("GET", "/api/files/download")
+          def api_file_download(c):
+              p = safe_path(c.q.get("path", ""))
+              if not p.is_file():
+                  raise ApiError(404, "File tidak ditemukan")
+              return Raw(path=p)
+
+
+          @route("PUT", "/api/files/upload")
+          def api_upload(c):
+              d = safe_path(c.q.get("path", ""))
+              name = os.path.basename(c.q.get("name", ""))
+              if not d.exists() and name:
+                  d.mkdir(parents=True, exist_ok=True)  # mis. folder plugins/ belum ada sebelum server pertama jalan
+              if not d.is_dir() or not name or name in (".", ".."):
+                  raise ApiError(400, "Tujuan tidak valid")
+              dest = safe_path(rel_of(d) + "/" + name)
+              n = to_int(c.h.headers.get("Content-Length"), 0)
+              lim = to_int(load_cfg()["upload_max_mb"], 512) * 1048576
+              if n <= 0:
+                  raise ApiError(400, "Isi file kosong")
+              if n > lim:
+                  raise ApiError(413, f"File melebihi batas {lim // 1048576} MB")
+              tmp, left = dest.with_name(dest.name + ".part"), n
+              try:
+                  with open(tmp, "wb") as f:
+                      while left > 0:
+                          ch = c.h.rfile.read(min(65536, left))
+                          if not ch:
+                              break
+                          f.write(ch)
+                          left -= len(ch)
+                  if left > 0:
+                      raise ApiError(400, "Unggahan terputus")
+                  os.replace(tmp, dest)
+              finally:
+                  tmp.unlink(missing_ok=True)
+              return {"name": name, "size": n}
+
+
+          # ── rute: backup
+          @route("GET", "/api/backups")
+          def api_backups(c):
+              return {"backups": list_backups()}
+
+
+          @route("POST", "/api/backups/create")
+          def api_backup_create(c):
+              r = create_backup("manual", bool(c.body.get("plugins", True)))
+              prune_backups()
+              return r
+
+
+          @route("POST", "/api/backups/restore")
+          def api_backup_restore(c):
+              return restore_backup(str(c.body.get("name", "")))
+
+
+          @route("POST", "/api/backups/delete")
+          def api_backup_delete(c):
+              n = str(c.body.get("name", ""))
+              if not backup_name_ok(n):
+                  raise ApiError(400, "Nama backup tidak valid")
+              (BACKUPS / n).unlink(missing_ok=True)
+
+
+          @route("GET", "/api/backups/download")
+          def api_backup_download(c):
+              n = c.q.get("name", "")
+              if not backup_name_ok(n) or not (BACKUPS / n).is_file():
+                  raise ApiError(404, "Backup tidak ditemukan")
+              return Raw(path=BACKUPS / n)
+
+
+          # ── rute: bedrock, tunnel
+          @route("GET", "/api/bedrock")
+          def api_bedrock(c):
+              g = geyser_installed()
+              return {**g, "port": geyser_port(), "auth": geyser_auth(), "config_exists": geyser_cfg().exists()}
+
+
+          @route("POST", "/api/bedrock/install")
+          def api_bedrock_install(c):
+              return {"installed": install_geyser()}
+
+
+          @route("POST", "/api/bedrock/auth")
+          def api_bedrock_auth(c):
+              p = geyser_cfg()
+              if not p.exists():
+                  raise ApiError(409, "Config Geyser belum ada. Jalankan server sekali sampai siap, lalu coba lagi.")
+              t = read_text(p)
+              new, n = re.subn(r"(?m)^(\s*auth-type:\s*)\S+", r"\1floodgate", t, count=1)
+              if not n:
+                  raise ApiError(409, "Baris auth-type tidak ketemu di config Geyser")
+              p.write_text(new, "utf-8")
+
+
+          @route("GET", "/api/tunnel")
+          def api_tunnel(c):
+              return tunnel_state()
+
+
+          @route("POST", "/api/tunnel/install")
+          def api_tunnel_install(c):
+              return install_playit()
+
+
+          @route("POST", "/api/tunnel/start")
+          def api_tunnel_start(c):
+              start_tunnel()
+
+
+          @route("POST", "/api/tunnel/stop")
+          def api_tunnel_stop(c):
+              tmux("kill-session", "-t", f"={S_TUN}")
+
+
+          # ── rute: pengaturan
+          @route("GET", "/api/settings")
+          def api_settings(c):
+              cf = load_cfg()
+              return {**{k: cf[k] for k in SETTABLE}, "mem_total": meminfo().get("MemTotal"), "eula": eula_ok(),
+                      "mc_version": mc_version(), "java_needed": java_major(mc_version()) if mc_version() else None}
+
+
+          @route("POST", "/api/settings")
+          def api_settings_save(c):
+              apply_settings(c.body)
+
+
+          @route("POST", "/api/settings/password")
+          def api_password(c):
+              pw = str(c.body.get("password", ""))
+              if len(pw) < 6:
+                  raise ApiError(400, "Password minimal 6 karakter")
+              set_password(pw)
+              SESSIONS.clear()
+
+
+          @route("POST", "/api/eula")
+          def api_eula(c):
+              if c.body.get("accept") is not True:
+                  raise ApiError(400, "EULA harus disetujui eksplisit")
+              SERVER.mkdir(parents=True, exist_ok=True)
+              (SERVER / "eula.txt").write_text("# Disetujui lewat panel (https://aka.ms/MinecraftEULA)\neula=true\n")
+
+
+          @route("GET", "/api/paper/versions")
+          def api_paper_versions(c):
+              return {"versions": paper_versions()[:40], "current": mc_version()}
+
+
+          @route("POST", "/api/paper/install")
+          def api_paper_install(c):
+              if server_state()["state"] != "stopped":
+                  raise ApiError(409, "Matikan server dulu sebelum mengganti Paper")
+              r = install_paper(str(c.body.get("version", "")).strip() or None)
+              r["java_ok"] = bool(shutil.which(java_bin(r["java"])) or Path(java_bin(r["java"])).exists())
+              return r
+
+
+          @route("POST", "/api/panel/restart")
+          def api_panel_restart(c):
+              def go():
+                  time.sleep(1)
+                  os.execv(sys.executable, [sys.executable] + sys.argv)
+              threading.Thread(target=go, daemon=True).start()
+
+
+          # ───────────────────────── CLI ─────────────────────────
+          def serve():
+              for d in (SERVER, PANEL, BACKUPS, TUNNEL):
+                  d.mkdir(parents=True, exist_ok=True)
+              c = load_cfg()
+              TAILER.start()
+              threading.Thread(target=watchdog, daemon=True).start()
+              try:
+                  srv = Srv((c["bind"], int(c["port"])), H)
+              except OSError as e:
+                  print(f"Gagal membuka port {c['port']}: {e}\nCoba: mc config port 8081", file=sys.stderr)
+                  sys.exit(1)
+              print(f"Panel jalan di http://{c['bind']}:{c['port']}", flush=True)
+              srv.serve_forever()
+
+
+          def cli_tail():
+              """Perintah CLI tidak punya pembaca log. Nyalakan dulu supaya status dan backup tahu server sudah siap atau belum."""
+              if not TAILER.is_alive():
+                  while TAILER.poll_once():
+                      pass
+                  TAILER.start()
+
+
+          def cli_server(args):
+              act = args[0] if args else "status"
+              if act == "start":
+                  start_server()
+                  print("Server dijalankan. Lihat konsol: mc console")
+              elif act == "stop":
+                  if server_state()["state"] == "stopped":
+                      print("Server sudah mati")
+                      return
+                  stop_server()
+                  print("Menghentikan server", end="", flush=True)
+                  for _ in range(190):
+                      if server_state()["state"] == "stopped":
+                          print(" selesai")
+                          return
+                      print(".", end="", flush=True)
+                      time.sleep(1)
+              elif act == "restart":
+                  stop_server()
+                  for _ in range(180):
+                      if server_state()["state"] == "stopped":
+                          break
+                      time.sleep(1)
+                  start_server()
+                  print("Server dijalankan ulang")
+              elif act == "kill":
+                  kill_server()
+                  print("Server dipaksa berhenti")
+              else:
+                  cli_tail()
+                  st = server_state()
+                  print({"running": "Berjalan", "starting": "Menyala…", "stopping": "Berhenti…", "stopped": "Mati"}[st["state"]])
+
+
+          def main(argv):
+              cmd = argv[1] if len(argv) > 1 else "serve"
+              rest = argv[2:]
+              try:
+                  if cmd == "serve":
+                      serve()
+                  elif cmd == "init":
+                      for d in (SERVER, PANEL, BACKUPS, TUNNEL):
+                          d.mkdir(parents=True, exist_ok=True)
+                      save_cfg(load_cfg())
+                  elif cmd == "server":
+                      cli_server(rest)
+                  elif cmd == "install-paper":
+                      r = install_paper(rest[0] if rest else None)
+                      print(f"Paper {r['version']} build {r['build']} terpasang")
+                      print(f"JAVA_MAJOR={r['java']}")
+                  elif cmd == "install-geyser":
+                      print("Terpasang:", ", ".join(install_geyser()))
+                  elif cmd == "install-playit":
+                      print("Terpasang:", install_playit()["file"])
+                  elif cmd == "java-major":
+                      print(java_major(rest[0]) if rest else 21)
+                  elif cmd == "passwd":
+                      if rest[:1] == ["--init"]:
+                          if load_cfg()["pw_hash"]:
+                              return
+                          rest = []
+                      pw = rest[0] if rest else secrets.token_urlsafe(9)
+                      if len(pw) < 6:
+                          sys.exit("Password minimal 6 karakter")
+                      set_password(pw)
+                      print(pw if not rest else "Password diganti")
+                  elif cmd == "config":
+                      if rest[:1] == ["set"] and len(rest) == 3:
+                          apply_settings({rest[1]: rest[2]})
+                      else:
+                          c = load_cfg()
+                          print(json.dumps({k: c[k] for k in SETTABLE}, indent=2))
+                  elif cmd == "eula":
+                      SERVER.mkdir(parents=True, exist_ok=True)
+                      (SERVER / "eula.txt").write_text("# Disetujui lewat installer (https://aka.ms/MinecraftEULA)\neula=true\n")
+                  elif cmd == "backup":
+                      cli_tail()
+                      print(create_backup("manual"))
+                  elif cmd == "tunnel":
+                      act = rest[0] if rest else "show"
+                      if act == "install":
+                          install_playit()
+                      if act in ("install", "start"):
+                          if not (TUNNEL / "playit").exists():
+                              install_playit()
+                          if act == "start":
+                              start_tunnel()
+                              print("Tunnel jalan. Lihat: mc tunnel show")
+                      elif act == "stop":
+                          tmux("kill-session", "-t", f"={S_TUN}")
+                      else:
+                          s = tunnel_state()
+                          print(s["output"] or "Tunnel belum jalan")
+                          if s["claim"]:
+                              print("\nBuka link ini untuk klaim agent:", s["claim"])
+                  else:
+                      print("Perintah tidak dikenal:", cmd)
+                      sys.exit(2)
+              except ApiError as e:
+                  sys.exit(f"Error: {e.msg}")
+              except urllib.error.URLError as e:
+                  sys.exit(f"Tidak bisa terhubung ke internet/server luar: {getattr(e, 'reason', e)}")
+
+
+          if __name__ == "__main__":
+              main(sys.argv)
+          __EOF_PANEL_PY__
+
+          cat > app/assets/index.html <<'__EOF_INDEX_HTML__'
+          <!doctype html>
+          <html lang="id">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <meta name="theme-color" content="#1b2029">
+          <title>Panel server Minecraft</title>
+          <link rel="stylesheet" href="/app.css">
+          </head>
+          <body>
+          <div id="app"></div>
+          <div id="toasts" aria-live="polite"></div>
+          <script src="/app.js"></script>
+          </body>
+          </html>
+          __EOF_INDEX_HTML__
+
+          cat > app/assets/app.js <<'__EOF_APP_JS__'
+          'use strict';
+          const $ = (s, r = document) => r.querySelector(s);
+
+          function h(tag, attrs, ...kids) {
+            const el = document.createElement(tag);
+            const late = {};
+            for (const [k, v] of Object.entries(attrs || {})) {
+              if (v == null || v === false) continue;
+              if (k === 'class') el.className = v;
+              else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+              else if (k === 'value' || k === 'checked') late[k] = v;
+              else el.setAttribute(k, v === true ? '' : v);
+            }
+            for (const kid of kids.flat(Infinity)) {
+              if (kid != null && kid !== false) el.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
+            }
+            for (const [k, v] of Object.entries(late)) el[k] = v;
+            return el;
+          }
+
+          const LABEL = { running: 'Berjalan', starting: 'Menyala…', stopping: 'Berhenti…', stopped: 'Mati' };
+          const TABS = [['dash', 'Ringkasan'], ['console', 'Konsol'], ['players', 'Pemain'], ['plugins', 'Plugin'], ['files', 'File'],
+            ['backups', 'Backup'], ['bedrock', 'Bedrock'], ['tunnel', 'Tunnel'], ['settings', 'Pengaturan']];
+          const S = { st: null, timers: [], onStatus: null, poll: null };
+
+          const fmtB = n => n == null ? '-' : n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(1) + ' KB'
+            : n < 1073741824 ? (n / 1048576).toFixed(1) + ' MB' : (n / 1073741824).toFixed(2) + ' GB';
+          const fmtDur = s => {
+            s = Math.max(0, Math.floor(s));
+            const d = Math.floor(s / 86400), j = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+            return (d ? d + ' hari ' : '') + (j ? j + ' jam ' : '') + m + ' menit';
+          };
+          const fmtT = t => new Date(t * 1000).toLocaleString('id-ID', { dateStyle: 'medium', timeStyle: 'short' });
+
+          function toast(msg, bad) {
+            const t = h('div', { class: 'toast' + (bad ? ' bad' : '') }, msg);
+            $('#toasts').append(t);
+            setTimeout(() => t.remove(), bad ? 7000 : 3200);
+          }
+
+          function modal(title, body, actions) {
+            const close = () => m.remove();
+            const m = h('div', { class: 'modal', onclick: e => { if (e.target === m) close(); } },
+              h('div', { class: 'box' },
+                h('div', { class: 'row sp' }, h('h2', {}, title), h('button', { class: 'btn small ghost', onclick: close }, 'Tutup')),
+                body,
+                h('div', { class: 'row', style: 'margin-top:12px' }, (actions || []).map(a =>
+                  h('button', {
+                    class: 'btn ' + (a.cls || ''), onclick: async ev => {
+                      const b = ev.currentTarget; b.disabled = true;
+                      try { await a.fn(close); } catch (e) { toast(e.message, true); } finally { b.disabled = false; }
+                    }
+                  }, a.label)))));
+            document.body.append(m);
+            return close;
+          }
+
+          async function api(method, path, body, raw) {
+            const opt = { method, headers: { 'X-Panel': '1' }, credentials: 'same-origin' };
+            if (raw) opt.body = raw;
+            else if (body !== undefined) { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
+            let r;
+            try { r = await fetch(path, opt); } catch (e) { throw new Error('Tidak bisa menghubungi panel. Pastikan Termux masih jalan.'); }
+            let j = {};
+            try { j = await r.json(); } catch (e) { /* bukan JSON */ }
+            if (r.status === 401 && path !== '/api/login') { showLogin(); throw new Error('Silakan masuk lagi'); }
+            if (!r.ok) throw new Error(j.error || 'Error ' + r.status);
+            return j;
+          }
+
+          async function upload(dir, file) {
+            let r;
+            try {
+              r = await fetch('/api/files/upload?path=' + encodeURIComponent(dir) + '&name=' + encodeURIComponent(file.name),
+                { method: 'PUT', headers: { 'X-Panel': '1' }, body: file, credentials: 'same-origin' });
+            } catch (e) { throw new Error('Unggahan gagal. Cek koneksi ke panel.'); }
+            const j = await r.json().catch(() => ({}));
+            if (!r.ok) throw new Error(j.error || 'Unggahan gagal');
+            return j;
+          }
+
+          function pickFile(accept, cb) {
+            const i = h('input', { type: 'file', accept: accept || null, style: 'display:none' });
+            i.addEventListener('change', () => { if (i.files[0]) cb(i.files[0]); i.remove(); });
+            document.body.append(i);
+            i.click();
+          }
+
+          async function run(fn, ok, btn) {
+            if (btn) btn.disabled = true;
+            try {
+              const r = await fn();
+              if (ok) toast(typeof ok === 'function' ? ok(r) : ok);
+              return r;
+            } catch (e) { toast(e.message, true); } finally {
+              if (btn) btn.disabled = false;
+              refreshStatus();
+            }
+          }
+          const act = (fn, ok) => ev => run(fn, ok, ev.currentTarget);
+
+          async function refreshStatus() {
+            try { S.st = await api('GET', '/api/status'); } catch (e) { return; }
+            const p = $('#pill');
+            if (p) { p.className = 'pill ' + S.st.state; p.textContent = LABEL[S.st.state]; }
+            if (S.onStatus) S.onStatus(S.st);
+          }
+          const every = (ms, fn) => S.timers.push(setInterval(fn, ms));
+          function reset() { S.timers.forEach(clearInterval); S.timers = []; S.onStatus = null; }
+          const kv = (k, v) => h('div', { class: 'kv' }, h('span', {}, k), h('b', {}, v));
+
+          // ─────────── Ringkasan
+          function pageDash() {
+            const box = h('div');
+            $('#view').replaceChildren(box);
+            let key = '';
+            S.onStatus = s => {
+              const k = JSON.stringify([s.state, s.players, s.paper_installed, s.eula, s.contact_set, s.lan_ip, s.geyser,
+                s.crashed, s.java_port, s.bedrock_port, s.mc_version, s.crash_log]);
+              if (k !== key) { key = k; box.replaceChildren(...dashStruct(s)); }
+              dashLive(s);
+            };
+            if (S.st) S.onStatus(S.st);
+          }
+
+          function meter(pct) {
+            const on = Math.round(pct / 5);
+            return h('div', { class: 'meter' + (pct > 85 ? ' max' : pct > 65 ? ' hot' : '') },
+              Array.from({ length: 20 }, (_, i) => h('i', { class: i < on ? 'on' : '' })));
+          }
+
+          function dashStruct(s) {
+            const on = s.state !== 'stopped', out = [];
+            out.push(h('section', { class: 'slab ' + s.state },
+              h('div', { class: 'slab-state' }, LABEL[s.state]),
+              h('div', { class: 'slab-sub', id: 'd-sub' }),
+              h('div', { class: 'row' },
+                !on && h('button', { class: 'btn primary big', onclick: act(() => api('POST', '/api/server/start'), 'Server dijalankan') }, 'Mulai server'),
+                on && h('button', { class: 'btn big', onclick: act(() => api('POST', '/api/server/stop'), 'Menghentikan server…') }, 'Hentikan'),
+                on && h('button', { class: 'btn', onclick: act(() => api('POST', '/api/server/restart'), 'Memulai ulang…') }, 'Restart'),
+                on && h('button', {
+                  class: 'btn danger', onclick: ev => confirm('Paksa berhenti? Dunia yang belum tersimpan bisa hilang.')
+                    && run(() => api('POST', '/api/server/kill'), 'Dipaksa berhenti', ev.currentTarget)
+                }, 'Paksa berhenti'))));
+            if (s.crash_log) {
+              out.push(h('div', { class: 'note bad' }, h('b', {}, 'Server berhenti dengan error. '), 'Output terakhir:',
+                h('pre', { class: 'out' }, s.crash_log)));
+            }
+            if (!s.paper_installed || !s.eula || !s.contact_set) out.push(setupCard(s));
+            out.push(h('div', { class: 'card' }, h('h2', {}, 'Alamat untuk join'),
+              kv('Java di HP ini', 'localhost:' + s.java_port),
+              kv('Java dari Wi-Fi yang sama', (s.lan_ip || '(IP tidak terdeteksi)') + ':' + s.java_port),
+              s.geyser.geyser ? [kv('Bedrock, alamat', s.lan_ip || '(IP tidak terdeteksi)'), kv('Bedrock, port (UDP)', String(s.bedrock_port))]
+                : h('p', {}, 'Bedrock belum aktif. Pasang Geyser di tab Bedrock.'),
+              h('p', { class: 'small' }, 'Teman di luar Wi-Fi? Pakai tab Tunnel.')));
+            out.push(h('div', { class: 'card' }, h('h2', {}, 'Sumber daya'), h('div', { id: 'd-res' })));
+            out.push(h('div', { class: 'card' }, h('h2', {}, 'Pemain online'),
+              s.players.length ? h('div', {}, s.players.map(p => h('span', { class: 'tag' }, p))) : h('p', {}, 'Belum ada pemain.')));
+            return out;
+          }
+
+          function setupCard(s) {
+            const contact = h('input', { class: 'inp', placeholder: 'Email atau URL kontakmu', autocapitalize: 'off' });
+            return h('div', { class: 'card' }, h('h2', {}, 'Persiapan awal'),
+              !s.contact_set && h('div', {}, h('label', { class: 'f' }, 'Kontak untuk unduhan Paper (wajib oleh PaperMC, hanya dikirim ke PaperMC)'),
+                h('div', { class: 'row' }, h('div', { class: 'grow' }, contact),
+                  h('button', { class: 'btn', onclick: act(() => api('POST', '/api/settings', { contact: contact.value }), 'Kontak tersimpan') }, 'Simpan'))),
+              !s.paper_installed && h('div', {}, h('label', { class: 'f' }, 'Pasang Paper (server Java) versi stabil terbaru'),
+                h('button', {
+                  class: 'btn primary', onclick: act(async () => {
+                    const r = await api('POST', '/api/paper/install', {});
+                    if (!r.java_ok) toast('Java ' + r.java + ' belum terpasang. Di Termux jalankan: pkg install openjdk-' + r.java, true);
+                    return r;
+                  }, r => 'Paper ' + r.version + ' terpasang')
+                }, 'Unduh dan pasang Paper')),
+              !s.eula && h('div', {}, h('label', { class: 'f' }, 'Minecraft EULA'),
+                h('p', {}, 'Dengan lanjut, kamu setuju dengan ', h('a', { href: 'https://aka.ms/MinecraftEULA', target: '_blank', rel: 'noopener' }, 'Minecraft EULA'), '.'),
+                h('button', { class: 'btn', onclick: act(() => api('POST', '/api/eula', { accept: true }), 'EULA disetujui') }, 'Saya setuju')));
+          }
+
+          function dashLive(s) {
+            const sub = $('#d-sub');
+            if (sub) {
+              sub.textContent = s.state === 'stopped'
+                ? (s.paper_installed ? 'Paper ' + (s.mc_version || '') + ' siap dijalankan' : 'Belum ada server terpasang')
+                : 'Paper ' + s.mc_version + (s.paper_build ? ' build ' + s.paper_build : '') + ', aktif ' + fmtDur(s.uptime)
+                  + ', ' + s.players.length + ' dari ' + s.max_players + ' pemain';
+            }
+            const res = $('#d-res');
+            if (!res) return;
+            const pct = s.rss_mb != null && s.ram_mb ? Math.min(100, s.rss_mb / s.ram_mb * 100) : 0;
+            res.replaceChildren(
+              kv('RAM server', s.rss_mb != null ? s.rss_mb + ' dari ' + s.ram_mb + ' MB' : 'server mati'), meter(pct),
+              kv('CPU server', s.cpu != null ? s.cpu + '%' : '-'),
+              kv('RAM HP yang tersisa', s.mem_avail != null ? s.mem_avail + ' dari ' + s.mem_total + ' MB' : '-'),
+              kv('Penyimpanan kosong', fmtB(s.disk_free_mb * 1048576)));
+          }
+
+          // ─────────── Konsol
+          function pageConsole() {
+            const log = h('pre', { class: 'log' });
+            const inp = h('input', {
+              class: 'inp', placeholder: 'Ketik perintah, mis. list', autocomplete: 'off', autocapitalize: 'off',
+              spellcheck: 'false', enterkeyhint: 'send'
+            });
+            let since = 0, busy = false;
+            const add = (t, cls) => {
+              const near = log.scrollHeight - log.scrollTop - log.clientHeight < 60;
+              const c = cls || (/ERROR|Exception|FATAL/.test(t) ? 'e' : /WARN/.test(t) ? 'w' : /^\[panel\]|Done \(/.test(t) ? 'n' : '');
+              log.append(h('div', { class: c }, t));
+              while (log.childElementCount > 1500) log.firstChild.remove();
+              if (near) log.scrollTop = log.scrollHeight;
+            };
+            const poll = async () => {
+              if (busy) return;
+              busy = true;
+              try { const r = await api('GET', '/api/console?since=' + since); r.lines.forEach(([, t]) => add(t)); since = r.next; } catch (e) { /* diam */ }
+              busy = false;
+            };
+            const send = async () => {
+              const v = inp.value.trim();
+              if (!v) return;
+              inp.value = '';
+              add('> ' + v, 'echo');
+              try { await api('POST', '/api/server/command', { cmd: v }); } catch (e) { toast(e.message, true); }
+            };
+            inp.addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
+            const quick = ['list', 'save-all', 'tps', 'say Halo semua!'].map(c =>
+              h('button', { class: 'btn small', onclick: () => { inp.value = c; send(); } }, c));
+            $('#view').replaceChildren(h('div', { class: 'card' }, log,
+              h('div', { class: 'row', style: 'margin-top:10px' }, h('div', { class: 'grow' }, inp), h('button', { class: 'btn primary', onclick: send }, 'Kirim')),
+              h('div', { class: 'row', style: 'margin-top:8px' }, quick)));
+            poll();
+            every(1000, poll);
+          }
+
+          // ─────────── Pemain
+          function pagePlayers() {
+            const box = h('div');
+            $('#view').replaceChildren(box);
+            const name = h('input', { class: 'inp', placeholder: 'Nama pemain (Bedrock diawali titik, mis. .Budi)', autocapitalize: 'off', spellcheck: 'false' });
+            const cmd = (a, n) => run(() => api('POST', '/api/players/action', { action: a, name: n }), 'Perintah dikirim: ' + a + ' ' + n);
+            let key = '';
+            S.onStatus = s => {
+              const k = JSON.stringify([s.players, s.state, s.max_players]);
+              if (k === key) return;
+              key = k;
+              box.replaceChildren(
+                h('div', { class: 'card' }, h('h2', {}, 'Pemain online (' + s.players.length + ' dari ' + s.max_players + ')'),
+                  s.players.length ? h('div', { class: 'list' }, s.players.map(p => h('div', { class: 'it' }, h('span', { class: 'nm' }, p),
+                    h('button', { class: 'btn small', onclick: () => cmd('op', p) }, 'Jadikan OP'),
+                    h('button', { class: 'btn small', onclick: () => cmd('kick', p) }, 'Tendang'),
+                    h('button', { class: 'btn small danger', onclick: () => confirm('Ban ' + p + '?') && cmd('ban', p) }, 'Ban'))))
+                    : h('p', {}, s.state === 'stopped' ? 'Server sedang mati.' : 'Belum ada pemain online.')),
+                h('div', { class: 'card' }, h('h2', {}, 'Kelola berdasarkan nama'), name,
+                  h('div', { class: 'row', style: 'margin-top:10px' },
+                    [['op', 'Jadikan OP'], ['deop', 'Cabut OP'], ['wl-add', 'Tambah whitelist'], ['wl-remove', 'Hapus whitelist'], ['ban', 'Ban'], ['pardon', 'Unban']]
+                      .map(([a, l]) => h('button', { class: 'btn small', onclick: () => name.value.trim() ? cmd(a, name.value.trim()) : toast('Isi nama pemain dulu', true) }, l))),
+                  h('p', { class: 'small' }, 'Whitelist hanya berlaku kalau diaktifkan di Pengaturan, bagian properti server.')));
+            };
+            if (S.st) S.onStatus(S.st);
+          }
+
+          // ─────────── Plugin
+          function pagePlugins() {
+            const inst = h('div', { class: 'card' }), found = h('div', { class: 'card' });
+            $('#view').replaceChildren(h('div', {}, inst, found));
+            const q = h('input', { class: 'inp', placeholder: 'Cari plugin di Modrinth, mis. EssentialsX', enterkeyhint: 'search' });
+            const compat = h('input', { type: 'checkbox', checked: true });
+            const results = h('div', { class: 'list' });
+
+            const load = async () => {
+              try {
+                const r = await api('GET', '/api/plugins');
+                inst.replaceChildren(
+                  h('div', { class: 'row sp' }, h('h2', {}, 'Terpasang (' + r.plugins.length + ')'),
+                    h('button', { class: 'btn small', onclick: () => pickFile('.jar', f => run(async () => { await upload('plugins', f); await load(); }, 'Plugin diunggah. Restart server agar dimuat.')) }, 'Unggah .jar')),
+                  r.plugins.length ? h('div', { class: 'list' }, r.plugins.map(p => h('div', { class: 'it' },
+                    h('div', { class: 'nm' }, h('b', {}, p.name), ' ', h('span', { class: 'mut small' }, p.version),
+                      h('div', { class: 'mut small' }, p.file + ', ' + fmtB(p.size) + (p.enabled ? '' : ', nonaktif'))),
+                    h('button', { class: 'btn small', onclick: ev => run(async () => { await api('POST', '/api/plugins/toggle', { file: p.file }); await load(); }, 'Diubah. Restart server agar berlaku.', ev.currentTarget) }, p.enabled ? 'Nonaktifkan' : 'Aktifkan'),
+                    h('button', { class: 'btn small danger', onclick: ev => confirm('Hapus ' + p.file + '?') && run(async () => { await api('POST', '/api/plugins/delete', { file: p.file }); await load(); }, 'Dihapus', ev.currentTarget) }, 'Hapus'))))
+                    : h('p', {}, 'Belum ada plugin.'),
+                  h('p', { class: 'small' }, 'Plugin dimuat saat server menyala. Setelah memasang atau mengubah plugin, restart server.'));
+              } catch (e) { toast(e.message, true); }
+            };
+
+            const search = async () => {
+              results.replaceChildren(h('p', {}, 'Mencari…'));
+              try {
+                const r = await api('GET', '/api/plugins/search?q=' + encodeURIComponent(q.value.trim()) + '&compat=' + (compat.checked ? 1 : 0));
+                results.replaceChildren(...(r.hits.length ? r.hits.map(hit => h('div', { class: 'it' },
+                  hit.icon && /^https:\/\/cdn\.modrinth\.com\//.test(hit.icon) ? h('img', { src: hit.icon, alt: '' }) : null,
+                  h('div', { class: 'nm' }, h('b', {}, hit.title), h('div', { class: 'mut small' }, hit.desc)),
+                  h('button', {
+                    class: 'btn small primary', onclick: ev => run(async () => { const x = await api('POST', '/api/plugins/install', { project: hit.id }); await load(); return x; },
+                      x => 'Terpasang: ' + x.installed.join(', ') + '. Restart server.', ev.currentTarget)
+                  }, 'Pasang')))
+                  : [h('p', {}, 'Tidak ada hasil. Coba matikan filter versi Minecraft.')]));
+              } catch (e) { results.replaceChildren(h('div', { class: 'note bad' }, e.message)); }
+            };
+            q.addEventListener('keydown', e => { if (e.key === 'Enter') search(); });
+            found.replaceChildren(h('h2', {}, 'Cari di Modrinth'), q,
+              h('label', { class: 'sw' }, compat, 'Hanya yang cocok dengan versi Minecraft server'),
+              h('button', { class: 'btn primary', onclick: search }, 'Cari'), results);
+            load();
+            search();
+          }
+
+          // ─────────── File
+          async function edit(path) {
+            try {
+              const r = await api('GET', '/api/files/read?path=' + encodeURIComponent(path));
+              const ta = h('textarea', { spellcheck: 'false', value: r.content });
+              modal(path, ta, [{
+                label: 'Simpan', cls: 'primary', fn: async close => {
+                  await api('POST', '/api/files/write', { path, content: ta.value });
+                  toast('Tersimpan. Restart server kalau ini file konfigurasi.');
+                  close();
+                }
+              }]);
+            } catch (e) { toast(e.message, true); }
+          }
+
+          function pageFiles() {
+            const box = h('div', { class: 'card' });
+            $('#view').replaceChildren(box);
+            let cur = '';
+            const join = (a, b) => a ? a + '/' + b : b;
+            const load = async p => {
+              try { const r = await api('GET', '/api/files?path=' + encodeURIComponent(p)); cur = r.path; draw(r); } catch (e) { toast(e.message, true); }
+            };
+            const draw = r => {
+              const parts = cur ? cur.split('/') : [];
+              box.replaceChildren(
+                h('div', { class: 'crumbs' }, h('a', { onclick: () => load('') }, 'server'),
+                  parts.map((p, i) => [' / ', h('a', { onclick: () => load(parts.slice(0, i + 1).join('/')) }, p)])),
+                h('div', { class: 'row', style: 'margin-bottom:8px' },
+                  h('button', { class: 'btn small', onclick: async () => { const n = prompt('Nama folder baru'); if (n) { await run(() => api('POST', '/api/files/mkdir', { path: join(cur, n) })); load(cur); } } }, 'Folder baru'),
+                  h('button', { class: 'btn small', onclick: () => pickFile('', async f => { await run(() => upload(cur, f), 'Diunggah'); load(cur); }) }, 'Unggah file')),
+                h('div', { class: 'list' },
+                  cur ? h('div', { class: 'it' }, h('a', { class: 'nm', onclick: () => load(parts.slice(0, -1).join('/')) }, '.. (naik satu folder)')) : null,
+                  r.items.map(it => h('div', { class: 'it' },
+                    h('a', { class: 'nm', onclick: () => it.dir ? load(join(cur, it.name)) : edit(join(cur, it.name)) }, (it.dir ? '[folder] ' : '') + it.name),
+                    h('span', { class: 'mut small' }, it.dir ? '' : fmtB(it.size)),
+                    !it.dir && h('a', { class: 'btn small', href: '/api/files/download?path=' + encodeURIComponent(join(cur, it.name)) }, 'Unduh'),
+                    h('button', { class: 'btn small', onclick: async () => { const n = prompt('Nama baru', it.name); if (n && n !== it.name) { await run(() => api('POST', '/api/files/rename', { path: join(cur, it.name), to: join(cur, n) })); load(cur); } } }, 'Ganti nama'),
+                    h('button', { class: 'btn small danger', onclick: async () => { if (confirm('Hapus ' + it.name + (it.dir ? ' beserta isinya' : '') + '?')) { await run(() => api('POST', '/api/files/delete', { path: join(cur, it.name) }), 'Dihapus'); load(cur); } } }, 'Hapus')))));
+            };
+            load('');
+          }
+
+          // ─────────── Backup
+          function pageBackups() {
+            const box = h('div');
+            $('#view').replaceChildren(box);
+            const plug = h('input', { type: 'checkbox', checked: true });
+            const load = async () => {
+              try {
+                const r = await api('GET', '/api/backups');
+                box.replaceChildren(
+                  h('div', { class: 'card' }, h('h2', {}, 'Buat backup'),
+                    h('p', {}, 'Isi: dunia, pengaturan server, daftar OP, whitelist, dan ban. Aman dibuat saat server menyala.'),
+                    h('label', { class: 'sw' }, plug, 'Sertakan data plugin (tanpa file .jar)'),
+                    h('button', { class: 'btn primary', onclick: ev => run(async () => { await api('POST', '/api/backups/create', { plugins: plug.checked }); await load(); }, 'Backup selesai', ev.currentTarget) }, 'Buat backup sekarang')),
+                  h('div', { class: 'card' }, h('h2', {}, 'Daftar backup (' + r.backups.length + ')'),
+                    r.backups.length ? h('div', { class: 'list' }, r.backups.map(b => h('div', { class: 'it' },
+                      h('div', { class: 'nm' }, b.name, h('div', { class: 'mut small' }, fmtT(b.mtime) + ', ' + fmtB(b.size))),
+                      h('a', { class: 'btn small', href: '/api/backups/download?name=' + encodeURIComponent(b.name) }, 'Unduh'),
+                      h('button', { class: 'btn small', onclick: ev => confirm('Pulihkan ' + b.name + '? Dunia saat ini dipindah ke folder _before-restore.') && run(() => api('POST', '/api/backups/restore', { name: b.name }), 'Dipulihkan. Silakan nyalakan server.', ev.currentTarget) }, 'Pulihkan'),
+                      h('button', { class: 'btn small danger', onclick: ev => confirm('Hapus backup ini?') && run(async () => { await api('POST', '/api/backups/delete', { name: b.name }); await load(); }, 'Dihapus', ev.currentTarget) }, 'Hapus'))))
+                      : h('p', {}, 'Belum ada backup.')));
+              } catch (e) { toast(e.message, true); }
+            };
+            load();
+          }
+
+          // ─────────── Bedrock
+          async function pageBedrock() {
+            const box = h('div');
+            $('#view').replaceChildren(box);
+            const load = async () => {
+              const [b, s] = await Promise.all([api('GET', '/api/bedrock'), api('GET', '/api/status')]);
+              const ip = s.lan_ip || '(IP tidak terdeteksi)', ok = b.geyser && b.floodgate;
+              box.replaceChildren(
+                h('div', { class: 'card' }, h('h2', {}, 'Bedrock lewat Geyser'),
+                  h('p', {}, 'Server Bedrock resmi hanya ada untuk komputer x86, jadi tidak bisa jalan langsung di HP. Geyser membuat pemain Bedrock (HP, Xbox, PlayStation, Switch) bisa join ke server Java ini. Floodgate membuat mereka tidak perlu akun Java.'),
+                  kv('Geyser', b.geyser ? 'terpasang' : 'belum'), kv('Floodgate', b.floodgate ? 'terpasang' : 'belum'),
+                  kv('Login Bedrock (auth-type)', b.auth || (b.config_exists ? '-' : 'config belum dibuat')),
+                  h('div', { class: 'row', style: 'margin-top:10px' },
+                    h('button', { class: 'btn primary', onclick: ev => run(async () => { const r = await api('POST', '/api/bedrock/install'); await load(); return r; }, r => 'Terpasang: ' + r.installed.join(', ') + '. Restart server.', ev.currentTarget) }, ok ? 'Perbarui Geyser dan Floodgate' : 'Pasang Geyser dan Floodgate'),
+                    b.config_exists && b.auth !== 'floodgate' && h('button', { class: 'btn', onclick: ev => run(async () => { await api('POST', '/api/bedrock/auth'); await load(); }, 'Diubah ke floodgate. Restart server.', ev.currentTarget) }, 'Login tanpa akun Java'))),
+                h('div', { class: 'card' }, h('h2', {}, 'Cara join dari Bedrock'),
+                  kv('Alamat', ip), kv('Port', b.port + ' (UDP)'),
+                  h('p', {}, 'Di Minecraft Bedrock: Play, Servers, Add Server, lalu isi alamat dan port di atas. Perangkat harus satu Wi-Fi dengan HP ini. Dari luar Wi-Fi, pakai tab Tunnel.')));
+            };
+            try { await load(); } catch (e) { toast(e.message, true); }
+          }
+
+          // ─────────── Tunnel
+          async function pageTunnel() {
+            const box = h('div');
+            $('#view').replaceChildren(box);
+            const load = async () => {
+              const t = await api('GET', '/api/tunnel');
+              box.replaceChildren(h('div', { class: 'card' }, h('h2', {}, 'Tunnel playit.gg'),
+                h('p', {}, 'Supaya teman di luar Wi-Fi bisa join tanpa membuka port router. Perlu akun gratis di playit.gg. Fitur ini masih eksperimental di Termux.'),
+                !t.installed && h('button', { class: 'btn primary', onclick: ev => run(async () => { await api('POST', '/api/tunnel/install'); await load(); }, 'Agent playit terpasang', ev.currentTarget) }, 'Pasang agent playit'),
+                t.installed && h('div', { class: 'row' },
+                  !t.running && h('button', { class: 'btn primary', onclick: ev => run(async () => { await api('POST', '/api/tunnel/start'); setTimeout(load, 2500); }, 'Tunnel dijalankan', ev.currentTarget) }, 'Jalankan tunnel'),
+                  t.running && h('button', { class: 'btn', onclick: ev => run(async () => { await api('POST', '/api/tunnel/stop'); await load(); }, 'Tunnel dihentikan', ev.currentTarget) }, 'Hentikan tunnel'),
+                  h('button', { class: 'btn small ghost', onclick: () => load() }, 'Segarkan')),
+                t.installed && !t.chroot && h('div', { class: 'note' }, 'termux-chroot tidak ada. Di Termux jalankan: pkg install proot resolv-conf'),
+                t.claim && h('div', { class: 'note ok' }, 'Klaim agent: ', h('a', { href: t.claim, target: '_blank', rel: 'noopener' }, t.claim)),
+                t.addresses.length ? h('div', {}, h('p', {}, 'Alamat tunnel yang terdeteksi:'), t.addresses.map(a => h('span', { class: 'tag' }, a))) : null,
+                t.output ? h('pre', { class: 'out' }, t.output) : null));
+            };
+            try { await load(); } catch (e) { toast(e.message, true); }
+          }
+
+          // ─────────── Pengaturan
+          const PROPS = [
+            ['motd', 'Nama server (MOTD)', 'text'], ['max-players', 'Maksimal pemain', 'num'],
+            ['difficulty', 'Kesulitan', ['peaceful', 'easy', 'normal', 'hard']], ['gamemode', 'Mode game', ['survival', 'creative', 'adventure', 'spectator']],
+            ['online-mode', 'Wajib akun Java asli (online-mode)', 'bool'], ['white-list', 'Whitelist', 'bool'], ['pvp', 'PvP', 'bool'],
+            ['allow-flight', 'Boleh terbang', 'bool'], ['hardcore', 'Hardcore', 'bool'], ['view-distance', 'Jarak pandang (chunk)', 'num'],
+            ['simulation-distance', 'Jarak simulasi (chunk)', 'num'], ['level-seed', 'Seed dunia', 'text'],
+            ['server-port', 'Port Java', 'num'], ['spawn-protection', 'Proteksi spawn', 'num']];
+          const DEFAULT_TRUE = ['online-mode', 'pvp'];
+
+          async function pageSettings() {
+            const box = h('div');
+            $('#view').replaceChildren(box);
+            const load = async () => {
+              const [c, pr] = await Promise.all([api('GET', '/api/settings'), api('GET', '/api/props')]);
+              const f = {};
+              const field = (k, label, help, type) => {
+                f[k] = h('input', { class: 'inp', type: type || 'text', value: c[k], autocapitalize: 'off', spellcheck: 'false' });
+                return h('div', {}, h('label', { class: 'f' }, label), f[k], help ? h('p', { class: 'small' }, help) : null);
+              };
+              const auto = h('input', { type: 'checkbox', checked: !!c.auto_restart });
+              const bind = h('select', { value: c.bind },
+                h('option', { value: '127.0.0.1' }, 'Hanya di HP ini (aman)'),
+                h('option', { value: '0.0.0.0' }, 'Bisa dibuka dari Wi-Fi (pakai password kuat)'));
+              const saveCfg = ev => run(() => api('POST', '/api/settings', {
+                ram_mb: f.ram_mb.value, jvm_flags: f.jvm_flags.value, contact: f.contact.value, backup_every_h: f.backup_every_h.value,
+                backup_keep: f.backup_keep.value, java: f.java.value, upload_max_mb: f.upload_max_mb.value, auto_restart: auto.checked, bind: bind.value
+              }), 'Tersimpan. RAM dan JVM berlaku saat server dijalankan ulang.', ev.currentTarget);
+
+              const pf = {};
+              const propRows = PROPS.map(([k, label, kind]) => {
+                const cur = pr.props[k] ?? '';
+                let el, init;
+                if (kind === 'bool') {
+                  init = cur === '' ? DEFAULT_TRUE.includes(k) : cur === 'true';
+                  el = h('input', { type: 'checkbox', checked: init });
+                } else if (Array.isArray(kind)) {
+                  init = cur;
+                  el = h('select', { value: cur }, h('option', { value: '' }, '(bawaan)'), kind.map(o => h('option', { value: o }, o)));
+                } else {
+                  init = cur;
+                  el = h('input', { class: 'inp', type: kind === 'num' ? 'number' : 'text', value: cur, placeholder: 'bawaan' });
+                }
+                pf[k] = { el, kind, init };
+                return kind === 'bool'
+                  ? h('div', {}, h('label', { class: 'sw' }, el, label),
+                    k === 'online-mode' ? h('p', { class: 'small' }, 'Matikan hanya untuk pemain non-premium. Siapa pun bisa memakai nama pemain lain, jadi aktifkan whitelist.') : null)
+                  : h('div', {}, h('label', { class: 'f' }, label), el);
+              });
+              const saveProps = ev => run(async () => {
+                const changes = {};
+                for (const [k, { el, kind, init }] of Object.entries(pf)) {
+                  if (kind === 'bool') { if (el.checked !== init) changes[k] = String(el.checked); }
+                  else if (el.value !== init) changes[k] = el.value;
+                }
+                if (!Object.keys(changes).length) return toast('Tidak ada yang berubah');
+                await api('POST', '/api/props', { changes });
+                toast('Properti tersimpan. Restart server agar berlaku.');
+              }, null, ev.currentTarget);
+
+              const ver = h('select', {}, h('option', { value: '' }, c.mc_version ? 'Versi sekarang: ' + c.mc_version : 'Pilih versi'));
+              const pw = h('input', { class: 'inp', type: 'password', placeholder: 'Password baru (minimal 6 karakter)', autocomplete: 'new-password' });
+
+              box.replaceChildren(
+                h('div', { class: 'card' }, h('h2', {}, 'Server'),
+                  field('ram_mb', 'RAM untuk server (MB)', 'HP ini punya ' + (c.mem_total || '?') + ' MB. Pakai maksimal sekitar 60% supaya Android tidak mematikan Termux.', 'number'),
+                  field('jvm_flags', 'Opsi JVM tambahan'), field('java', 'Lokasi Java (kosongkan untuk otomatis)'),
+                  field('contact', 'Kontak untuk unduhan Paper (email atau URL)'),
+                  h('label', { class: 'sw' }, auto, 'Jalankan ulang otomatis kalau server crash'),
+                  field('backup_every_h', 'Backup otomatis tiap berapa jam (0 = mati)', null, 'number'),
+                  field('backup_keep', 'Simpan berapa backup otomatis', null, 'number'),
+                  field('upload_max_mb', 'Batas ukuran unggahan (MB)', null, 'number'),
+                  h('div', { class: 'row', style: 'margin-top:12px' }, h('button', { class: 'btn primary', onclick: saveCfg }, 'Simpan pengaturan'))),
+                h('div', { class: 'card' }, h('h2', {}, 'Properti server'), propRows,
+                  h('div', { class: 'row', style: 'margin-top:12px' }, h('button', { class: 'btn primary', onclick: saveProps }, 'Simpan properti')),
+                  h('p', { class: 'small' }, 'Properti lain bisa diedit di tab File, file server.properties.')),
+                h('div', { class: 'card' }, h('h2', {}, 'Versi Paper'),
+                  h('p', {}, c.mc_version ? 'Terpasang Minecraft ' + c.mc_version + ' (butuh Java ' + c.java_needed + ').' : 'Paper belum terpasang.'), ver,
+                  h('div', { class: 'row', style: 'margin-top:10px' },
+                    h('button', { class: 'btn', onclick: ev => run(async () => { const r = await api('GET', '/api/paper/versions'); ver.replaceChildren(h('option', { value: '' }, 'Terbaru yang stabil'), r.versions.map(v => h('option', { value: v }, v))); }, null, ev.currentTarget) }, 'Lihat daftar versi'),
+                    h('button', {
+                      class: 'btn primary', onclick: ev => run(async () => {
+                        const r = await api('POST', '/api/paper/install', { version: ver.value });
+                        if (!r.java_ok) toast('Java ' + r.java + ' belum terpasang. Di Termux jalankan: pkg install openjdk-' + r.java, true);
+                        await load();
+                        return r;
+                      }, r => 'Paper ' + r.version + ' build ' + r.build + ' terpasang', ev.currentTarget)
+                    }, 'Pasang atau perbarui Paper')),
+                  h('p', { class: 'small' }, 'Matikan server dulu. Buat backup sebelum ganti versi karena plugin lama bisa tidak cocok.')),
+                h('div', { class: 'card' }, h('h2', {}, 'Minecraft EULA'),
+                  c.eula ? h('p', {}, 'EULA sudah disetujui.') : h('div', {}, h('p', {}, 'Dengan lanjut, kamu setuju dengan ', h('a', { href: 'https://aka.ms/MinecraftEULA', target: '_blank', rel: 'noopener' }, 'Minecraft EULA'), '.'),
+                    h('button', { class: 'btn', onclick: act(async () => { await api('POST', '/api/eula', { accept: true }); await load(); }, 'EULA disetujui') }, 'Saya setuju'))),
+                h('div', { class: 'card' }, h('h2', {}, 'Akses panel'), bind,
+                  h('p', { class: 'small' }, 'Mengubah ini perlu panel dimulai ulang. Simpan pengaturan dulu, lalu mulai ulang.'),
+                  h('div', { class: 'row' }, h('button', { class: 'btn', onclick: ev => run(async () => { await api('POST', '/api/panel/restart'); setTimeout(() => location.reload(), 3500); }, 'Panel dimulai ulang…', ev.currentTarget) }, 'Mulai ulang panel'))),
+                h('div', { class: 'card' }, h('h2', {}, 'Password panel'), pw,
+                  h('div', { class: 'row', style: 'margin-top:10px' }, h('button', { class: 'btn', onclick: ev => run(async () => { await api('POST', '/api/settings/password', { password: pw.value }); toast('Password diganti. Silakan masuk lagi.'); setTimeout(() => location.reload(), 1200); }, null, ev.currentTarget) }, 'Ganti password'))));
+            };
+            try { await load(); } catch (e) { toast(e.message, true); }
+          }
+
+          // ─────────── Kerangka
+          const PAGES = { dash: pageDash, console: pageConsole, players: pagePlayers, plugins: pagePlugins, files: pageFiles,
+            backups: pageBackups, bedrock: pageBedrock, tunnel: pageTunnel, settings: pageSettings };
+
+          async function logout() {
+            try { await api('POST', '/api/logout'); } catch (e) { /* abaikan */ }
+            location.reload();
+          }
+
+          function shell() {
+            $('#app').replaceChildren(
+              h('header', { class: 'top' },
+                h('div', { class: 'brand' }, h('span', { class: 'cube' }), h('span', {}, 'Panel server')),
+                h('span', { id: 'pill', class: 'pill stopped' }, '…'),
+                h('button', { class: 'btn small ghost', onclick: logout }, 'Keluar')),
+              h('nav', { class: 'tabs', id: 'tabs' }, TABS.map(([k, l]) => h('a', { href: '#' + k, 'data-k': k }, l))),
+              h('main', { id: 'view' }));
+          }
+
+          function go() {
+            reset();
+            const k = (location.hash || '#dash').slice(1);
+            const key = PAGES[k] ? k : 'dash';
+            document.querySelectorAll('#tabs a').forEach(a => a.classList.toggle('on', a.dataset.k === key));
+            PAGES[key]();
+            if (S.st && S.onStatus) S.onStatus(S.st);
+          }
+
+          function showLogin(configured) {
+            reset();
+            clearInterval(S.poll);
+            const inp = h('input', { class: 'inp', type: 'password', placeholder: 'Password panel', autocomplete: 'current-password' });
+            const enter = async () => {
+              try { await api('POST', '/api/login', { password: inp.value }); start(); } catch (e) { toast(e.message, true); }
+            };
+            inp.addEventListener('keydown', e => { if (e.key === 'Enter') enter(); });
+            $('#app').replaceChildren(h('div', { class: 'login' }, h('div', { class: 'card' },
+              h('h2', {}, 'Masuk ke panel server'),
+              configured === false ? h('div', { class: 'note bad' }, 'Password belum dibuat. Di Termux jalankan: mc passwd') : null,
+              inp, h('div', { class: 'row', style: 'margin-top:10px' }, h('button', { class: 'btn primary grow', onclick: enter }, 'Masuk')),
+              h('p', { class: 'small' }, 'Lupa password? Di Termux jalankan: mc passwd'))));
+            inp.focus();
+          }
+
+          async function start() {
+            let s;
+            try { s = await api('GET', '/api/session'); } catch (e) {
+              $('#app').replaceChildren(h('div', { class: 'login' }, h('div', { class: 'card' },
+                h('h2', {}, 'Panel tidak bisa dihubungi'), h('p', {}, e.message), h('button', { class: 'btn', onclick: () => location.reload() }, 'Coba lagi'))));
+              return;
+            }
+            if (!s.authed) return showLogin(s.configured);
+            shell();
+            await refreshStatus();
+            go();
+            clearInterval(S.poll);
+            S.poll = setInterval(refreshStatus, 2500);
+          }
+
+          window.addEventListener('hashchange', () => { if ($('#view')) go(); });
+          start();
+          __EOF_APP_JS__
+
+          cat > app/assets/app.css <<'__EOF_APP_CSS__'
+          :root{
+            --bg:#1b2029; --panel:#252c38; --panel2:#2e3745; --edge:#0d1016; --hi:#44506a;
+            --tx:#e9edf4; --mut:#98a4ba; --lapis:#3d6fe0; --lapis2:#5b88f0;
+            --ok:#3dbd7d; --warn:#e2b53e; --bad:#d9473f;
+            --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+          }
+          *{box-sizing:border-box}
+          html{-webkit-text-size-adjust:100%}
+          body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+          a{color:var(--lapis2)}
+          button,input,select,textarea{font:inherit;color:inherit}
+          :focus-visible{outline:3px solid var(--lapis2);outline-offset:2px}
+
+          /* tombol bergaya GUI Minecraft: tepi terang di kiri-atas, gelap di kanan-bawah */
+          .btn{cursor:pointer;border:2px solid var(--edge);background:var(--panel2);padding:9px 14px;min-height:42px;font-weight:600;border-radius:0;
+            box-shadow:inset 2px 2px 0 rgba(255,255,255,.16),inset -2px -2px 0 rgba(0,0,0,.38)}
+          .btn:hover{background:#38435a}
+          .btn:active{box-shadow:inset 2px 2px 0 rgba(0,0,0,.38),inset -2px -2px 0 rgba(255,255,255,.1)}
+          .btn:disabled{opacity:.5;cursor:not-allowed}
+          a.btn{display:inline-block;text-decoration:none;color:var(--tx)}
+          .btn.primary{background:var(--lapis)} .btn.primary:hover{background:var(--lapis2)}
+          .btn.danger{background:#8d2e29} .btn.danger:hover{background:var(--bad)}
+          .btn.ghost{background:transparent}
+          .btn.small{min-height:34px;padding:5px 10px;font-size:13px}
+          .btn.big{min-height:52px;padding:12px 22px;font-size:17px}
+
+          .inp,select,textarea{width:100%;background:#12161d;border:2px solid var(--edge);border-radius:0;padding:9px 10px;min-height:42px;
+            box-shadow:inset 2px 2px 0 rgba(0,0,0,.45)}
+          textarea{font-family:var(--mono);font-size:13px;min-height:50vh;resize:vertical}
+
+          .top{display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--panel);border-bottom:2px solid var(--edge)}
+          .brand{display:flex;align-items:center;gap:9px;font-weight:800;flex:1;letter-spacing:.01em}
+          .cube{width:20px;height:20px;background:linear-gradient(135deg,#6bd08f 0 50%,#4a9a67 50% 100%);border:2px solid var(--edge);box-shadow:inset 2px 2px 0 rgba(255,255,255,.3)}
+          .pill{padding:3px 10px;font-weight:700;font-size:13px;border:2px solid var(--edge);background:var(--panel2)}
+          .pill.running{background:var(--ok);color:#06210f} .pill.starting,.pill.stopping{background:var(--warn);color:#2b2000} .pill.stopped{background:#4a5266}
+
+          .tabs{display:flex;overflow-x:auto;background:var(--panel);border-bottom:2px solid var(--edge);position:sticky;top:0;z-index:5;scrollbar-width:none}
+          .tabs::-webkit-scrollbar{display:none}
+          .tabs a{padding:12px 15px;text-decoration:none;color:var(--mut);white-space:nowrap;font-weight:600;border-bottom:4px solid transparent}
+          .tabs a.on{color:var(--tx);border-bottom-color:var(--ok)}
+          main{max-width:920px;margin:0 auto;padding:14px 14px 60px}
+
+          .card{background:var(--panel);border:2px solid var(--edge);padding:14px;margin:0 0 14px;box-shadow:inset 2px 2px 0 rgba(255,255,255,.06),inset -2px -2px 0 rgba(0,0,0,.3)}
+          .card h2{margin:0 0 10px;font-size:16px}
+          .card p{margin:6px 0;color:var(--mut)}
+          .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+          .row.sp{justify-content:space-between}
+          .grow{flex:1;min-width:140px}
+          .mut{color:var(--mut)} .small{font-size:13px}
+          .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}
+          .kv{display:flex;justify-content:space-between;gap:10px;padding:7px 0;border-bottom:1px solid var(--edge)}
+          .kv:last-child{border-bottom:0}
+          .kv b{font-family:var(--mono);font-weight:600;word-break:break-all;text-align:right}
+          .tag{display:inline-block;padding:2px 8px;background:var(--panel2);border:2px solid var(--edge);margin:2px;font-size:13px}
+
+          /* blok status: satu-satunya elemen besar */
+          .slab{border:3px solid var(--edge);padding:18px 16px;margin:0 0 14px;background:#2a3140;
+            box-shadow:inset 4px 4px 0 rgba(255,255,255,.12),inset -4px -4px 0 rgba(0,0,0,.35)}
+          .slab.running{background:#1f4a36} .slab.starting,.slab.stopping{background:#4d4020} .slab.stopped{background:#2a3140}
+          .slab-state{font-size:34px;font-weight:900;letter-spacing:.01em;line-height:1.1}
+          .slab-sub{color:#cdd6e6;margin:4px 0 14px;min-height:1.4em}
+
+          /* meter ala bar XP: 20 kotak */
+          .meter{display:grid;grid-template-columns:repeat(20,1fr);gap:2px;margin:6px 0 2px}
+          .meter i{height:12px;background:#12161d;border:1px solid var(--edge)}
+          .meter i.on{background:var(--ok)} .meter.hot i.on{background:var(--warn)} .meter.max i.on{background:var(--bad)}
+
+          .log{margin:0;background:#0f1319;border:2px solid var(--edge);padding:10px;height:56vh;overflow:auto;font:12.5px/1.4 var(--mono);white-space:pre-wrap;word-break:break-word}
+          .log .w{color:var(--warn)} .log .e{color:#ff7a72} .log .echo{color:var(--lapis2)} .log .n{color:var(--ok)}
+
+          .list .it{display:flex;gap:10px;align-items:center;padding:10px 0;border-bottom:1px solid var(--edge);flex-wrap:wrap}
+          .list .it:last-child{border-bottom:0}
+          .it .nm{flex:1;min-width:150px;word-break:break-word}
+          .it img{width:40px;height:40px;background:var(--panel2);border:2px solid var(--edge)}
+          .crumbs{font-family:var(--mono);font-size:13px;margin-bottom:10px;word-break:break-all}
+          .crumbs a{cursor:pointer}
+          .sw{display:flex;gap:10px;align-items:center;padding:8px 0}
+          .sw input{width:22px;height:22px;accent-color:var(--ok)}
+          label.f{display:block;margin:10px 0 4px;color:var(--mut);font-size:13px}
+          .note{border-left:4px solid var(--warn);padding:6px 10px;background:#2c2a1d;margin:8px 0}
+          .note.bad{border-color:var(--bad);background:#2f1d1d}
+          .note.ok{border-color:var(--ok);background:#1b2e24}
+          pre.out{background:#0f1319;border:2px solid var(--edge);padding:10px;overflow:auto;max-height:260px;font:12px/1.4 var(--mono);white-space:pre-wrap;word-break:break-all}
+
+          .modal{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:20;display:flex;align-items:flex-start;justify-content:center;overflow:auto;padding:14px}
+          .modal .box{background:var(--panel);border:3px solid var(--edge);width:100%;max-width:820px;padding:14px;margin-top:4vh}
+          #toasts{position:fixed;left:0;right:0;bottom:12px;display:flex;flex-direction:column;align-items:center;gap:6px;z-index:30;pointer-events:none;padding:0 12px}
+          .toast{background:#202838;border:2px solid var(--edge);border-left:6px solid var(--ok);padding:10px 14px;max-width:560px;box-shadow:0 4px 0 rgba(0,0,0,.4)}
+          .toast.bad{border-left-color:var(--bad)}
+          .login{max-width:380px;margin:12vh auto;padding:0 14px}
+          @media (prefers-reduced-motion:no-preference){.slab.starting .slab-state::after,.slab.stopping .slab-state::after{content:"";display:inline-block;width:.5em;height:.5em;margin-left:.4em;background:var(--warn);animation:bl 1s steps(2) infinite}}
+          @keyframes bl{50%{opacity:0}}
+          __EOF_APP_CSS__
+
+          echo "File sumber ditulis:"; find app -type f | sort
+
+      - name: Bangun APK
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          [ -d "$SDK/build-tools" ] || { echo "Android SDK tidak ketemu di $SDK"; exit 1; }
+          BTV="$(ls "$SDK/build-tools" | grep -E '^[0-9]+(\.[0-9]+)*$' | sort -V | tail -n1)"
+          PLV="$(ls "$SDK/platforms" | grep -E '^android-[0-9]+$' | sort -V | tail -n1)"
+          BT="$SDK/build-tools/$BTV"
+          AJ="$SDK/platforms/$PLV/android.jar"
+          echo "build-tools $BTV, platform $PLV"
+          test -f "$AJ"
+          cd app
+          rm -rf build
+          mkdir -p build/classes build/dex
+          "$BT/aapt2" compile --dir res -o build/res.zip
+          "$BT/aapt2" link -o build/base.apk -I "$AJ" --manifest AndroidManifest.xml -A assets \
+            --min-sdk-version 24 --target-sdk-version 33 --version-code 1 --version-name 1.0 build/res.zip
+          javac -encoding UTF-8 -source 8 -target 8 -Xlint:-options -bootclasspath "$AJ" \
+            -d build/classes $(find java -name '*.java')
+          "$BT/d8" --release --lib "$AJ" --min-api 24 --output build/dex $(find build/classes -name '*.class')
+          cp build/base.apk build/unsigned.apk
+          (cd build/dex && zip -q ../unsigned.apk classes.dex)
+          "$BT/zipalign" -f -p 4 build/unsigned.apk build/aligned.apk
+          keytool -genkeypair -keystore build/debug.keystore -storepass android -keypass android \
+            -alias servermc -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Server MC"
+          "$BT/apksigner" sign --ks build/debug.keystore --ks-pass pass:android --key-pass pass:android \
+            --out ../ServerMC.apk build/aligned.apk
+          "$BT/apksigner" verify --print-certs ../ServerMC.apk
+          ls -l ../ServerMC.apk
+
+      - name: Unggah APK sebagai artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ServerMC-apk
+          path: ServerMC.apk
+          if-no-files-found: error
+
+      - name: Terbitkan di Releases
+        uses: softprops/action-gh-release@v2
+        continue-on-error: true
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Server MC build ${{ github.run_number }}
+          body: APK Server MC. Pasang, lalu ikuti langkah 1 sampai 3 di layar aplikasi.
+          files: ServerMC.apk
